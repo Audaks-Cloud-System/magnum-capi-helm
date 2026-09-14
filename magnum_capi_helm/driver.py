@@ -10,6 +10,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 import enum
+import ipaddress
 import re
 
 import requests
@@ -38,6 +39,21 @@ from magnum_capi_helm import kubernetes
 LOG = logging.getLogger(__name__)
 CONF = conf.CONF
 NODE_GROUP_ROLE_CONTROLLER = "master"
+SCALE_TO_ZERO_MIN_CHART_VERSION = (0, 26, 0)
+
+
+def _gather_label_names():
+    regular_label_names = set(
+        opt.name for opt in conf.capi_helm_cluster_labels_opts
+    )
+    deprecated_label_names = []
+    for opt in conf.capi_helm_cluster_labels_opts:
+        for dep_opt in opt.deprecated_opts:
+            deprecated_label_names.append(dep_opt.name)
+    return frozenset(regular_label_names.union(set(deprecated_label_names)))
+
+
+_REGISTERED_LABEL_NAMES = _gather_label_names()
 
 
 class NodeGroupState(enum.Enum):
@@ -48,6 +64,8 @@ class NodeGroupState(enum.Enum):
 
 
 class Driver(driver.Driver):
+    needs_trust = False
+
     def __init__(self):
         self._helm_client = helm.Client()
         self.__k8s_client = None
@@ -691,6 +709,11 @@ class Driver(driver.Driver):
             )
 
     def _label(self, cluster, key, default):
+        if key not in _REGISTERED_LABEL_NAMES:
+            raise ValueError(
+                f"Cluster label '{key}' is not registered in "
+                "capi_helm_cluster_labels. Add it to conf.py first."
+            )
         all_labels = helm.mergeconcat(
             cluster.cluster_template.labels, cluster.labels
         )
@@ -713,6 +736,25 @@ class Driver(driver.Driver):
         except ValueError:
             return default
 
+    def _get_label_csv(self, cluster, label, default):
+        """Return a cluster label as a filtered list split on commas."""
+        if label not in _REGISTERED_LABEL_NAMES:
+            raise ValueError(
+                f"Cluster label '{label}' is not registered in "
+                "capi_helm_cluster_labels. Add it to conf.py first."
+            )
+        all_labels = helm.mergeconcat(
+            cluster.cluster_template.labels, cluster.labels
+        )
+        raw = (all_labels or {}).get(label, "") or default
+        if not raw:
+            return []
+        return [
+            re.sub(r"[^a-zA-Z0-9\.\-\/\:]+", "", entry.strip())
+            for entry in str(raw).split(",")
+            if entry.strip()
+        ]
+
     def _get_chart_version(self, cluster):
         version = cluster.cluster_template.labels.get(
             "capi_helm_chart_version",
@@ -721,9 +763,31 @@ class Driver(driver.Driver):
         # NOTE(johngarbutt): filtering untrusted user input
         return re.sub(r"[^a-z0-9\.\-\+]+", "", version)
 
+    def _parse_chart_version(self, version_str):
+        """Return (major, minor, patch) tuple, ignore pre-release suffixes."""
+        nums = []
+        for part in re.split(r"[.\-]", version_str)[:3]:
+            if part.isdigit():
+                nums.append(int(part))
+            else:
+                break
+        return tuple(nums)
+
+    def _chart_supports_scale_to_zero(self, cluster):
+        version = self._get_chart_version(cluster)
+        return (
+            self._parse_chart_version(version)
+            >= SCALE_TO_ZERO_MIN_CHART_VERSION
+        )
+
     def _get_kube_version(self, image):
-        # The image should have a property containing the Kubernetes version
-        kube_version = image.get("kube_version")
+        # The image should have a property containing the Kubernetes version.
+        # image.get() uses dict.get() which bypasses the overridden __getitem__
+        # in openstacksdk Resource objects (data lives in _body, not the dict).
+        # Unknown properties are packed into image.properties by openstacksdk.
+        kube_version = image.get("kube_version") or getattr(
+            image, "properties", {}
+        ).get("kube_version")
         if not kube_version:
             raise exception.MagnumException(
                 message=f"Image {image.id} does not "
@@ -734,7 +798,10 @@ class Driver(driver.Driver):
         return re.sub(r"[^0-9\.]+", "", raw)
 
     def _get_os_distro(self, image):
-        os_distro = image.get("os_distro")
+        # image.get() uses dict.get() which bypasses the overridden __getitem__
+        # in openstacksdk Resource objects. os_distro is a declared Body field
+        # in openstacksdk Image, so getattr() reaches it via the descriptor.
+        os_distro = image.get("os_distro") or getattr(image, "os_distro", None)
         if not os_distro:
             raise exception.MagnumException(
                 message=f"Image {image.id} does not "
@@ -743,10 +810,15 @@ class Driver(driver.Driver):
         return re.sub(r"[^a-zA-Z0-9\.\-\/ ]+", "", os_distro)
 
     def _get_image_details(self, context, image_identifier):
-        osc = clients.OpenStackClients(context)
-        image = api_utils.get_openstack_resource(
-            osc.glance().images, image_identifier, "images"
-        )
+        glance = clients.OpenStackClients(context).glance()
+        if hasattr(glance.images, "get"):
+            # glanceclient
+            image = api_utils.get_openstack_resource(
+                glance.images, image_identifier, "images"
+            )
+        else:
+            # openstacksdk
+            image = glance.find_image(image_identifier)
         return (
             image.id,
             self._get_kube_version(image),
@@ -759,6 +831,8 @@ class Driver(driver.Driver):
     def _get_app_cred_id(self, cluster):
         # determine the existing application credential secret
         secret_name = self._get_app_cred_secret_name(cluster)
+        if not secret_name:
+            return None
         secret_namespace = driver_utils.cluster_namespace(cluster)
 
         # fetch the existing secret and unpack the application credential ID
@@ -781,18 +855,25 @@ class Driver(driver.Driver):
         )
 
     def _get_etcd_config(self, cluster):
+        lconf = CONF.capi_helm_cluster_labels
         # Support new-style and legacy labels for volume size and type, with
         # new-style labels taking precedence
         etcd_size = self._get_label_int(
             cluster,
             "etcd_blockdevice_size",
-            self._get_label_int(cluster, "etcd_volume_size", 0),
+            self._get_label_int(
+                cluster,
+                "etcd_volume_size",
+                lconf.etcd_blockdevice_size,
+            ),
         )
         if etcd_size > 0:
             etcd_block_device = {"size": etcd_size}
             # The block device type can be either local or volume
             etcd_bd_type = self._label(
-                cluster, "etcd_blockdevice_type", "volume"
+                cluster,
+                "etcd_blockdevice_type",
+                lconf.etcd_blockdevice_type,
             )
             if etcd_bd_type == "local":
                 etcd_block_device["type"] = "Local"
@@ -802,13 +883,19 @@ class Driver(driver.Driver):
                 etcd_volume_type = self._label(
                     cluster,
                     "etcd_blockdevice_volume_type",
-                    self._label(cluster, "etcd_volume_type", ""),
+                    self._label(
+                        cluster,
+                        "etcd_volume_type",
+                        lconf.etcd_blockdevice_volume_type,
+                    ),
                 )
                 if etcd_volume_type:
                     etcd_block_device["volumeType"] = etcd_volume_type
 
                 etcd_volume_az = self._label(
-                    cluster, "etcd_blockdevice_volume_az", ""
+                    cluster,
+                    "etcd_blockdevice_volume_az",
+                    lconf.etcd_blockdevice_volume_az,
                 )
                 if etcd_volume_az:
                     etcd_block_device["availabilityZone"] = etcd_volume_az
@@ -824,19 +911,32 @@ class Driver(driver.Driver):
             return None
 
     def _get_monitoring_enabled(self, cluster):
-        #  NOTE(mkjpryor) default off, like heat driver,
-        #  as requires cinder and takes a while
-        return self._get_label_bool(cluster, "monitoring_enabled", False)
+        return self._get_label_bool(
+            cluster,
+            "monitoring_enabled",
+            CONF.capi_helm_cluster_labels.monitoring_enabled,
+        )
 
     def _get_kube_dash_enabled(self, cluster):
-        #  NOTE(mkjpryor) default on, like the heat driver
-        return self._get_label_bool(cluster, "kube_dashboard_enabled", True)
+        return self._get_label_bool(
+            cluster,
+            "kube_dashboard_enabled",
+            CONF.capi_helm_cluster_labels.kube_dashboard_enabled,
+        )
 
     def _get_autoheal_enabled(self, cluster):
-        return self._get_label_bool(cluster, "auto_healing_enabled", True)
+        return self._get_label_bool(
+            cluster,
+            "auto_healing_enabled",
+            CONF.capi_helm_cluster_labels.auto_healing_enabled,
+        )
 
     def _get_autoscale_enabled(self, cluster):
-        return self._get_label_bool(cluster, "auto_scaling_enabled", False)
+        return self._get_label_bool(
+            cluster,
+            "auto_scaling_enabled",
+            CONF.capi_helm_cluster_labels.auto_scaling_enabled,
+        )
 
     def _get_autoscale_values(self, cluster, nodegroup):
         auto_scale = self._get_autoscale_enabled(cluster)
@@ -851,7 +951,11 @@ class Driver(driver.Driver):
         return auto_scale_args
 
     def _get_k8s_keystone_auth_enabled(self, cluster):
-        return self._get_label_bool(cluster, "keystone_auth_enabled", False)
+        return self._get_label_bool(
+            cluster,
+            "keystone_auth_enabled",
+            CONF.capi_helm_cluster_labels.keystone_auth_enabled,
+        )
 
     def _get_fixed_network_id(self, context, cluster):
         network = cluster.fixed_network
@@ -864,13 +968,114 @@ class Driver(driver.Driver):
                 context, network, source="name", target="id", external=False
             )
 
+    def _validate_cidr_no_overlap(self, context, cluster):
+        """Raise MagnumException if pod/service CIDRs overlap."""
+        pod_cidr_str = self._label(
+            cluster, "pod_network_cidr", "10.100.0.0/16"
+        )
+        service_cidr_str = self._label(
+            cluster, "service_network_cidr", "172.24.0.0/13"
+        )
+
+        try:
+            pod_net = ipaddress.ip_network(pod_cidr_str, strict=False)
+        except ValueError:
+            raise exception.MagnumException(
+                message=(
+                    f"pod_network_cidr '{pod_cidr_str}' is not a valid CIDR."
+                )
+            )
+        try:
+            service_net = ipaddress.ip_network(service_cidr_str, strict=False)
+        except ValueError:
+            raise exception.MagnumException(
+                message=(
+                    f"service_network_cidr '{service_cidr_str}'"
+                    " is not a valid CIDR."
+                )
+            )
+
+        if pod_net.overlaps(service_net):
+            raise exception.MagnumException(
+                message=(
+                    f"Pod CIDR {pod_cidr_str} overlaps with service CIDR "
+                    f"{service_cidr_str}. Use the 'pod_network_cidr' and "
+                    "'service_network_cidr' labels to set non-overlapping"
+                    " CIDRs."
+                )
+            )
+
+        nc = clients.OpenStackClients(context).neutron()
+        subnets_to_check = []
+
+        def _iter_subnets(nid):
+            if hasattr(nc, "list_subnets"):
+                # neutronclient (Magnum stable branches)
+                for s in nc.list_subnets(network_id=nid).get("subnets", []):
+                    yield s.get("cidr"), (s.get("name") or s.get("id", "?"))
+            else:
+                # openstacksdk (Magnum master)
+                for s in nc.subnets(network_id=nid):
+                    yield getattr(s, "cidr", None), (
+                        getattr(s, "name", None) or getattr(s, "id", "?")
+                    )
+
+        network_id = self._get_fixed_network_id(context, cluster)
+        if network_id:
+            for cidr, name in _iter_subnets(network_id):
+                if cidr:
+                    subnets_to_check.append(
+                        (cidr, f"fixed network subnet '{name}'")
+                    )
+
+        ext_net_id = neutron.get_external_network_id(
+            context, cluster.cluster_template.external_network_id
+        )
+        if ext_net_id:
+            for cidr, name in _iter_subnets(ext_net_id):
+                if cidr:
+                    subnets_to_check.append(
+                        (cidr, f"external network subnet '{name}'")
+                    )
+
+        for cidr_str, label in subnets_to_check:
+            try:
+                net = ipaddress.ip_network(cidr_str, strict=False)
+            except ValueError:
+                continue
+            if net.version != pod_net.version:
+                continue
+
+            if pod_net.overlaps(net):
+                raise exception.MagnumException(
+                    message=(
+                        f"Pod CIDR {pod_cidr_str} overlaps with {label} "
+                        f"({cidr_str}). Use the 'pod_network_cidr' label "
+                        "to set a non-overlapping CIDR"
+                        " (e.g. '10.100.0.0/16')."
+                    )
+                )
+            if service_net.overlaps(net):
+                raise exception.MagnumException(
+                    message=(
+                        f"Service CIDR {service_cidr_str} overlaps with"
+                        f" {label} ({cidr_str}). Use the"
+                        " 'service_network_cidr' label to set a"
+                        " non-overlapping CIDR (e.g. '10.96.0.0/12')."
+                    )
+                )
+
     def _validate_allowed_flavor(self, context, requested_flavor):
         # Compare requested flavor with allowed for Kubernetes node
-        flavors = (
-            clients.OpenStackClients(context)
-            .nova()
-            .flavors.list(min_ram=CONF.capi_helm.minimum_flavor_ram)
-        )
+        nova = clients.OpenStackClients(context).nova()
+        if hasattr(nova.flavors, "list"):
+            # novaclient
+            flavors = nova.flavors.list(
+                min_ram=CONF.capi_helm.minimum_flavor_ram
+            )
+        else:
+            # openstacksdk compute proxy
+            flavors = nova.flavors(min_ram=CONF.capi_helm.minimum_flavor_ram)
         for flavor in flavors:
             vcpus = flavor.vcpus
             LOG.debug(
@@ -922,11 +1127,17 @@ class Driver(driver.Driver):
             # We still want to be able to override the default node
             # group values with labels for consistent behaviour with
             # Magnum Heat driver.
+            conf_min = CONF.capi_helm_cluster_labels.min_node_count
+            conf_max = CONF.capi_helm_cluster_labels.max_node_count
             min_nodes = self._get_label_int(
-                cluster, "min_node_count", min_nodes
+                cluster,
+                "min_node_count",
+                conf_min if conf_min is not None else min_nodes,
             )
             max_nodes = self._get_label_int(
-                cluster, "max_node_count", max_nodes
+                cluster,
+                "max_node_count",
+                conf_max if conf_max is not None else max_nodes,
             )
 
         return min_nodes, max_nodes
@@ -941,22 +1152,30 @@ class Driver(driver.Driver):
         )
 
         if min_nodes is not None:
-            # ClusterAPI Provider OpenStack (CAPO)
-            # doesn't support scale to zero yet.
-            if min_nodes < 1:
+            if min_nodes < 0:
                 raise exception.NodeGroupInvalidInput(
                     message="Min node count must be greater than "
-                    "or equal to 1 for all node groups."
+                    "or equal to 0 for all node groups."
                 )
-            if min_nodes > nodegroup.node_count:
+            if min_nodes == 0 and not self._chart_supports_scale_to_zero(
+                cluster
+            ):
                 raise exception.NodeGroupInvalidInput(
-                    message="Min node count must be less than "
-                    "or equal to current node count"
+                    message=(
+                        "Scale to zero requires capi-helm-charts >= 0.26.0. "
+                        "Set the capi_helm_chart_version label or update "
+                        "default_helm_chart_version in magnum.conf."
+                    )
                 )
             if max_nodes is not None and max_nodes < min_nodes:
                 raise exception.NodeGroupInvalidInput(
                     message="Max node count must be greater than "
                     "or equal to min node count"
+                )
+            if min_nodes > nodegroup.node_count:
+                raise exception.NodeGroupInvalidInput(
+                    message="Min node count must be less than "
+                    "or equal to current node count"
                 )
 
         return min_nodes, max_nodes
@@ -965,54 +1184,71 @@ class Driver(driver.Driver):
         return self._label(
             cluster,
             "csi_cinder_availability_zone",
-            CONF.capi_helm.csi_cinder_availability_zone,
+            CONF.capi_helm_cluster_labels.csi_cinder_availability_zone,
         )
 
     def _get_csi_cinder_reclaim_policy(self, cluster):
         return self._label(
             cluster,
             "csi_cinder_reclaim_policy",
-            CONF.capi_helm.csi_cinder_reclaim_policy,
+            CONF.capi_helm_cluster_labels.csi_cinder_reclaim_policy,
         )
 
     def _get_csi_cinder_volume_binding_mode(self, cluster):
         return self._label(
             cluster,
             "csi_cinder_volume_binding_mode",
-            CONF.capi_helm.csi_cinder_volume_binding_mode,
+            CONF.capi_helm_cluster_labels.csi_cinder_volume_binding_mode,
         )
 
     def _get_csi_cinder_fstype(self, cluster):
         return self._label(
             cluster,
             "csi_cinder_fstype",
-            CONF.capi_helm.csi_cinder_fstype,
+            CONF.capi_helm_cluster_labels.csi_cinder_fstype,
         )
 
     def _get_csi_cinder_allow_volume_expansion(self, cluster):
         return self._get_label_bool(
             cluster,
             "csi_cinder_allow_volume_expansion",
-            CONF.capi_helm.csi_cinder_allow_volume_expansion,
+            CONF.capi_helm_cluster_labels.csi_cinder_allow_volume_expansion,
         )
 
     def _get_octavia_provider(self, cluster):
-        return self._label(cluster, "octavia_provider", "amphora")
+        return self._label(
+            cluster,
+            "octavia_provider",
+            CONF.capi_helm_cluster_labels.octavia_provider,
+        )
+
+    def _get_cni_type(self, cluster):
+        network_driver = cluster.cluster_template.network_driver
+        if not network_driver:
+            return None
+        # NOTE: filtering untrusted user input
+        return re.sub(r"[^a-zA-Z0-9\.\-_]+", "", network_driver)
 
     def _get_octavia_lb_algorithm(self, cluster):
         provider = self._get_octavia_provider(cluster)
+        conf_default = CONF.capi_helm_cluster_labels.octavia_lb_algorithm
+        dynamic_default = (
+            "SOURCE_IP_PORT" if provider.lower() == "ovn" else "ROUND_ROBIN"
+        )
         return self._label(
             cluster,
             "octavia_lb_algorithm",
-            "SOURCE_IP_PORT" if provider.lower() == "ovn" else "ROUND_ROBIN",
+            conf_default or dynamic_default,
         )
 
     def _get_allowed_cidrs(self, cluster):
-        cidr_list = cluster.labels.get("api_master_lb_allowed_cidrs", "")
-        LOG.debug(f"CIDR list {cidr_list}")
-        if isinstance(cidr_list, str) and cidr_list != "":
-            return cidr_list.split(",")
-        return False
+        cidrs = self._get_label_csv(
+            cluster,
+            "api_master_lb_allowed_cidrs",
+            CONF.capi_helm_cluster_labels.api_master_lb_allowed_cidrs,
+        )
+        LOG.debug(f"CIDR list {cidrs}")
+        return cidrs or False
 
     def _storageclass_definitions(self, context, cluster):
         """Query cinder API to retrieve list of available volume types.
@@ -1020,10 +1256,15 @@ class Driver(driver.Driver):
         @return dict(dict,list(dict)) containing storage classes
         """
         LOG.debug("Retrieve volume types from cinder for StorageClasses.")
-        client = clients.OpenStackClients(context)
         availability_zone = self._get_csi_cinder_availability_zone(cluster)
-        c_client = client.cinder()
-        volume_types = [i.name for i in c_client.volume_types.list()]
+        c_client = clients.OpenStackClients(context).cinder()
+        if hasattr(c_client, "volume_types"):
+            # cinderclient
+            volume_types = [i.name for i in c_client.volume_types.list()]
+        else:
+            # openstacksdk block storage proxy exposes types(),
+            # not volume_types
+            volume_types = [i.name for i in c_client.types()]
         # Use the default volume type if defined. Otherwise use the first
         # type returned by cinder.
         default_volume_type = CONF.capi_helm.csi_cinder_default_volume_type
@@ -1088,6 +1329,7 @@ class Driver(driver.Driver):
         return nodegroup_set
 
     def _update_helm_release(self, context, cluster, nodegroups=None):
+        lconf = CONF.capi_helm_cluster_labels
         if nodegroups is None:
             nodegroups = cluster.nodegroups
 
@@ -1110,8 +1352,11 @@ class Driver(driver.Driver):
                 "associateFloatingIP": self._get_label_bool(
                     cluster,
                     "master_lb_floating_ip_enabled",
-                    True,
+                    lconf.master_lb_floating_ip_enabled,
                 ),
+                # Disabling load balancers is not supported
+                # Please have a look at:
+                # https://docs.openstack.org/magnum-capi-helm/latest/configuration/index.html#tip-tricks
                 "enableLoadBalancer": True,
                 "loadBalancerProvider": self._get_octavia_provider(cluster),
             },
@@ -1127,8 +1372,26 @@ class Driver(driver.Driver):
                     "subnetFilter": ({"id": subnet_id} if subnet_id else None),
                     # This is only used if a fixed network is not specified
                     "nodeCidr": self._label(
-                        cluster, "fixed_subnet_cidr", "10.0.0.0/24"
+                        cluster,
+                        "fixed_subnet_cidr",
+                        lconf.fixed_subnet_cidr,
                     ),
+                },
+            },
+            "kubeNetwork": {
+                "pods": {
+                    "cidrBlocks": [
+                        self._label(
+                            cluster, "pod_network_cidr", "10.100.0.0/16"
+                        )
+                    ]
+                },
+                "services": {
+                    "cidrBlocks": [
+                        self._label(
+                            cluster, "service_network_cidr", "172.24.0.0/13"
+                        )
+                    ]
                 },
             },
             "osDistro": os_distro,
@@ -1157,7 +1420,9 @@ class Driver(driver.Driver):
                                 cluster
                             ),
                             "create-monitor": self._get_label_bool(
-                                cluster, "octavia_lb_healthcheck", True
+                                cluster,
+                                "octavia_lb_healthcheck",
+                                lconf.octavia_lb_healthcheck,
                             ),
                         }
                     },
@@ -1177,7 +1442,9 @@ class Driver(driver.Driver):
         # Add boot disk details, if defined in config file.
         # Helm chart defaults to ephemeral disks, if unset.
         boot_volume_type = self._label(
-            cluster, "boot_volume_type", CONF.cinder.default_boot_volume_type
+            cluster,
+            "boot_volume_type",
+            lconf.boot_volume_type or CONF.cinder.default_boot_volume_type,
         )
         if boot_volume_type:
             disk_type_details = {
@@ -1194,8 +1461,15 @@ class Driver(driver.Driver):
             }
             values = helm.mergeconcat(values, disk_type_details)
 
+        conf_boot_size = lconf.boot_volume_size
         boot_volume_size_gb = self._get_label_int(
-            cluster, "boot_volume_size", CONF.cinder.default_boot_volume_size
+            cluster,
+            "boot_volume_size",
+            (
+                conf_boot_size
+                if conf_boot_size is not None
+                else CONF.cinder.default_boot_volume_size
+            ),
         )
         if boot_volume_size_gb:
             disk_size_details = {
@@ -1214,20 +1488,36 @@ class Driver(driver.Driver):
 
         # Sometimes you need to add an extra network
         # for things like Cinder CSI CephFS Native
-        extra_network_name = self._label(cluster, "extra_network_name", "")
-        if extra_network_name:
+        # NOTE(mattcrees): extra_network_name is deprecated, so
+        # extra_network_names takes precedence if both are set.
+        # extra_network_name should be removed in a future release.
+        extra_network_name = self._label(
+            cluster,
+            "extra_network_name",
+            "",
+        )
+        extra_network_names = self._label(
+            cluster,
+            "extra_network_names",
+            lconf.extra_network_names,
+        )
+        if extra_network_name and not extra_network_names:
+            extra_network_names = extra_network_name
+        if extra_network_names:
+            ports = [{}]
+            for network in extra_network_names.split(" "):
+                ports.append(
+                    {
+                        "network": {
+                            "name": network,
+                        },
+                        "securityGroups": [],
+                    }
+                )
             network_details = {
                 "nodeGroupDefaults": {
                     "machineNetworking": {
-                        "ports": [
-                            {},
-                            {
-                                "network": {
-                                    "name": extra_network_name,
-                                },
-                                "securityGroups": [],
-                            },
-                        ],
+                        "ports": ports,
                     },
                 },
             }
@@ -1276,6 +1566,11 @@ class Driver(driver.Driver):
             }
             values = helm.mergeconcat(values, allowed_cidrs_config)
 
+        cni_type = self._get_cni_type(cluster)
+        if cni_type:
+            cni_config = {"addons": {"cni": {"type": cni_type}}}
+            values = helm.mergeconcat(values, cni_config)
+
         self._helm_client.install_or_upgrade(
             driver_utils.chart_release_name(cluster),
             CONF.capi_helm.helm_chart_name,
@@ -1309,6 +1604,7 @@ class Driver(driver.Driver):
         nodegroups = cluster.nodegroups
         for ng in nodegroups:
             self._validate_allowed_flavor(context, ng.flavor_id)
+        self._validate_cidr_no_overlap(context, cluster)
         # we generate this name (on the initial create call only)
         # so we hit no issues with duplicate cluster names
         # and it makes renaming clusters in the API possible

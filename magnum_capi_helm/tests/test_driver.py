@@ -46,6 +46,9 @@ class ClusterAPIDriverTest(base.DbTestCase):
             if ng.role != "master":
                 ng.flavor_id = "flavor_medium"
                 ng.save()
+        patcher = mock.patch.object(driver.Driver, "_validate_cidr_no_overlap")
+        self.mock_validate_cidr_no_overlap = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_provides(self):
         self.assertEqual(
@@ -967,24 +970,39 @@ class ClusterAPIDriverTest(base.DbTestCase):
         self.cluster_obj.labels = dict()
         self.cluster_obj.cluster_template.labels = dict()
 
-        result = self.driver._label(self.cluster_obj, "foo", "bar")
+        result = self.driver._label(
+            self.cluster_obj, "monitoring_enabled", "bar"
+        )
 
         self.assertEqual("bar", result)
 
     def test_label_return_template(self):
-        self.cluster_obj.cluster_template.labels = dict(foo=42)
+        self.cluster_obj.cluster_template.labels = dict(monitoring_enabled=42)
 
-        result = self.driver._label(self.cluster_obj, "foo", "bar")
+        result = self.driver._label(
+            self.cluster_obj, "monitoring_enabled", "bar"
+        )
 
         self.assertEqual("42", result)
 
     def test_label_return_cluster(self):
-        self.cluster_obj.labels = dict(foo=41)
-        self.cluster_obj.cluster_template.labels = dict(foo=42)
+        self.cluster_obj.labels = dict(monitoring_enabled=41)
+        self.cluster_obj.cluster_template.labels = dict(monitoring_enabled=42)
 
-        result = self.driver._label(self.cluster_obj, "foo", "bar")
+        result = self.driver._label(
+            self.cluster_obj, "monitoring_enabled", "bar"
+        )
 
         self.assertEqual("41", result)
+
+    def test_label_unregistered_key_raises(self):
+        self.assertRaises(
+            ValueError,
+            self.driver._label,
+            self.cluster_obj,
+            "not_a_real_label",
+            "default",
+        )
 
     def test_sanitized_name_no_suffix(self):
         self.assertEqual(
@@ -1004,6 +1022,7 @@ class ClusterAPIDriverTest(base.DbTestCase):
     def test_get_kube_version_raises(self):
         mock_image = mock.Mock()
         mock_image.get.return_value = None
+        mock_image.properties = {}
         mock_image.id = "myid"
 
         e = self.assertRaises(
@@ -1025,6 +1044,17 @@ class ClusterAPIDriverTest(base.DbTestCase):
 
         self.assertEqual("1.27.9", result)
         mock_image.get.assert_called_once_with("kube_version")
+
+    def test_get_kube_version_works_from_properties(self):
+        # openstacksdk Image: dict.get() returns None but custom properties
+        # are accessible via image.properties (unknown attrs packed there)
+        mock_image = mock.Mock()
+        mock_image.get.return_value = None
+        mock_image.properties = {"kube_version": "v1.27.9"}
+
+        result = self.driver._get_kube_version(mock_image)
+
+        self.assertEqual("1.27.9", result)
 
     @mock.patch("magnum.common.clients.OpenStackClients", autospec=True)
     @mock.patch("magnum.api.utils.get_openstack_resource", autospec=True)
@@ -1080,35 +1110,55 @@ class ClusterAPIDriverTest(base.DbTestCase):
         mock_image.get.assert_any_call("os_distro")
         mock_get.assert_called_once_with(mock.ANY, "myimagename", "images")
 
-    def test_get_chart_release_name_length(self):
-        self.cluster_obj.stack_id = "foo"
+    @mock.patch("magnum.common.clients.OpenStackClients", autospec=True)
+    def test_get_image_details_ubuntu_openstacksdk(self, mock_osc):
+        # Simulate real openstacksdk Image: dict.get() returns None because
+        # Resource(dict) stores data in _body not the dict storage. Known
+        # fields (os_distro) are attributes; unknown fields (kube_version)
+        # are in image.properties.
+        mock_image = mock.Mock()
+        mock_image.get.return_value = None
+        mock_image.os_distro = "ubuntu"
+        mock_image.properties = {"kube_version": "1.27.9"}
+        mock_image.id = "myid"
+        mock_glance = mock.MagicMock()
+        mock_glance.images = mock.Mock(spec=[])  # no 'get' → openstacksdk path
+        mock_glance.find_image.return_value = mock_image
+        mock_osc.return_value.glance.return_value = mock_glance
 
-        result = driver_utils.chart_release_name(self.cluster_obj)
+        id, version, distro = self.driver._get_image_details(
+            self.context, "myimagename"
+        )
 
-        self.assertEqual("foo", result)
+        self.assertEqual("1.27.9", version)
+        self.assertEqual("myid", id)
+        self.assertEqual("ubuntu", distro)
+        mock_glance.find_image.assert_called_once_with("myimagename")
 
-    def test_generate_release_name_skip(self):
-        self.cluster_obj.stack_id = "foo"
-        self.driver._generate_release_name(self.cluster_obj)
-        self.assertEqual("foo", self.cluster_obj.stack_id)
+    @mock.patch("magnum.common.clients.OpenStackClients", autospec=True)
+    def test_get_image_details_flatcar_openstacksdk(self, mock_osc):
+        # Simulate real openstacksdk Image: dict.get() returns None because
+        # Resource(dict) stores data in _body not the dict storage. Known
+        # fields (os_distro) are attributes; unknown fields (kube_version)
+        # are in image.properties.
+        mock_image = mock.Mock()
+        mock_image.get.return_value = None
+        mock_image.os_distro = "flatcar"
+        mock_image.properties = {"kube_version": "1.28.2"}
+        mock_image.id = "myid-flatcar"
+        mock_glance = mock.MagicMock()
+        mock_glance.images = mock.Mock(spec=[])  # no 'get' → openstacksdk path
+        mock_glance.find_image.return_value = mock_image
+        mock_osc.return_value.glance.return_value = mock_glance
 
-    def test_generate_release_name_generates(self):
-        self.cluster_obj.stack_id = None
-        self.cluster_obj.name = "a" * 77
+        id, version, distro = self.driver._get_image_details(
+            self.context, "myimagename"
+        )
 
-        self.driver._generate_release_name(self.cluster_obj)
-        first = self.cluster_obj.stack_id
-
-        self.assertEqual(43, len(first))
-        self.assertTrue(self.cluster_obj.name[:30] in first)
-
-        self.cluster_obj.stack_id = None
-        self.driver._generate_release_name(self.cluster_obj)
-        second = self.cluster_obj.stack_id
-
-        self.assertNotEqual(first, second)
-        self.assertEqual(43, len(second))
-        self.assertTrue(self.cluster_obj.name[:30] in second)
+        self.assertEqual("1.28.2", version)
+        self.assertEqual("myid-flatcar", id)
+        self.assertEqual("flatcar", distro)
+        mock_glance.find_image.assert_called_once_with("myimagename")
 
     def test_get_monitoring_enabled_from_template(self):
 
@@ -1175,6 +1225,10 @@ class ClusterAPIDriverTest(base.DbTestCase):
                     "nodeCidr": "10.0.0.0/24",
                 },
                 "dnsNameservers": ["8.8.1.1"],
+            },
+            "kubeNetwork": {
+                "pods": {"cidrBlocks": ["10.100.0.0/16"]},
+                "services": {"cidrBlocks": ["172.24.0.0/13"]},
             },
             "etcd": {},
             "apiServer": {
@@ -1438,7 +1492,7 @@ class ClusterAPIDriverTest(base.DbTestCase):
     @mock.patch.object(kubernetes.Client, "load", autospec=True)
     @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
     @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
-    def test_create_cluster_boot_volume_extra_network(
+    def test_create_cluster_boot_volume_extra_networks(
         self,
         mock_install,
         mock_image,
@@ -1461,7 +1515,9 @@ class ClusterAPIDriverTest(base.DbTestCase):
         CONF.cinder.default_boot_volume_type = "nvme"
         CONF.cinder.default_boot_volume_size = 12
         # Driver should combine boot volume with extra network.
-        self.cluster_obj.cluster_template.labels["extra_network_name"] = "foo"
+        self.cluster_obj.cluster_template.labels["extra_network_names"] = (
+            "foo bar"
+        )
 
         self.driver.create_cluster(self.context, self.cluster_obj, 10)
 
@@ -1480,6 +1536,12 @@ class ClusterAPIDriverTest(base.DbTestCase):
                 {
                     "network": {
                         "name": "foo",
+                    },
+                    "securityGroups": [],
+                },
+                {
+                    "network": {
+                        "name": "bar",
                     },
                     "securityGroups": [],
                 },
@@ -1914,6 +1976,49 @@ class ClusterAPIDriverTest(base.DbTestCase):
             self.driver, self.context, self.cluster_obj
         )
 
+    @mock.patch.object(driver.Driver, "_get_allowed_cidrs")
+    @mock.patch.object(
+        driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
+    )
+    @mock.patch.object(
+        driver.Driver,
+        "_storageclass_definitions",
+        return_value=mock.ANY,
+    )
+    @mock.patch.object(driver.Driver, "_validate_allowed_flavor")
+    @mock.patch.object(
+        driver.Driver, "_ensure_certificate_secrets", autospec=True
+    )
+    @mock.patch.object(driver.Driver, "_create_appcred_secret", autospec=True)
+    @mock.patch.object(kubernetes.Client, "load", autospec=True)
+    @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
+    @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
+    def test_create_cluster_network_driver(
+        self,
+        mock_install,
+        mock_image,
+        mock_load,
+        mock_appcred,
+        mock_certs,
+        mock_validate_allowed_flavor,
+        mock_storageclasses,
+        mock_get_keystone_auth_enabled,
+        mock_get_allowed_cidrs,
+    ):
+        mock_image.return_value = ("imageid1", "1.27.4", "ubuntu")
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+
+        self.cluster_obj.cluster_template.network_driver = "cilium"
+
+        self.driver.create_cluster(self.context, self.cluster_obj, 10)
+
+        expected_values = self._get_cluster_helm_standard_values()
+        expected_values["addons"]["cni"] = {"type": "cilium"}
+
+        helm_install_values = mock_install.call_args[0][3]
+        self.assertDictEqual(helm_install_values, expected_values)
+
     @mock.patch.object(app_creds, "create_app_cred")
     @mock.patch.object(app_creds, "get_app_cred_string_data")
     @mock.patch.object(kubernetes.Client, "load")
@@ -1988,7 +2093,9 @@ class ClusterAPIDriverTest(base.DbTestCase):
     @mock.patch("magnum.common.clients.OpenStackClients.cinder")
     def test_get_storage_classes(self, mock_cinder):
         CONF.capi_helm.csi_cinder_default_volume_type = "type3"
-        CONF.capi_helm.csi_cinder_availability_zone = "middle_earth_east"
+        CONF.capi_helm_cluster_labels.csi_cinder_availability_zone = (
+            "middle_earth_east"
+        )
         mock_vol_type_1 = mock.MagicMock()
         mock_vol_type_1.name = "type1"
         mock_vol_type_2 = mock.MagicMock()
@@ -2023,7 +2130,9 @@ class ClusterAPIDriverTest(base.DbTestCase):
     @mock.patch("magnum.common.clients.OpenStackClients.cinder")
     def test_get_storage_class_volume_type_not_available(self, mock_cinder):
         CONF.capi_helm.csi_cinder_default_volume_type = "type4"
-        CONF.capi_helm.csi_cinder_availability_zone = "middle_earth_east"
+        CONF.capi_helm_cluster_labels.csi_cinder_availability_zone = (
+            "middle_earth_east"
+        )
         mock_vol_type_1 = mock.MagicMock()
         mock_vol_type_1.name = "type1"
         mock_vol_type_2 = mock.MagicMock()
@@ -2050,7 +2159,9 @@ class ClusterAPIDriverTest(base.DbTestCase):
     @mock.patch("magnum.common.clients.OpenStackClients.cinder")
     def test_get_storage_class_volume_type_not_defined(self, mock_cinder):
         CONF.capi_helm.csi_cinder_default_volume_type = None
-        CONF.capi_helm.csi_cinder_availability_zone = "middle_earth_east"
+        CONF.capi_helm_cluster_labels.csi_cinder_availability_zone = (
+            "middle_earth_east"
+        )
         mock_vol_type_1 = mock.MagicMock()
         mock_vol_type_1.name = "__TYPE1__"
         mock_vol_type_2 = mock.MagicMock()
@@ -2065,6 +2176,104 @@ class ClusterAPIDriverTest(base.DbTestCase):
         ]
         mock_cinder_client = mock.Mock()
         mock_cinder_client.volume_types = mock_volume_types
+        mock_cinder.return_value = mock_cinder_client
+        storage_classes = self.driver._storageclass_definitions(
+            self.context, self.cluster_obj
+        )
+        default_storage_class = storage_classes["defaultStorageClass"]
+        volume_type = default_storage_class["name"]
+        self.assertEqual("type1", volume_type)
+
+    @mock.patch("magnum.common.clients.OpenStackClients.cinder")
+    def test_get_storage_classes_openstacksdk(self, mock_cinder):
+        CONF.capi_helm.csi_cinder_default_volume_type = "type3"
+        CONF.capi_helm_cluster_labels.csi_cinder_availability_zone = (
+            "middle_earth_east"
+        )
+        mock_vol_type_1 = mock.MagicMock()
+        mock_vol_type_1.name = "type1"
+        mock_vol_type_2 = mock.MagicMock()
+        mock_vol_type_2.name = "type2"
+        mock_vol_type_3 = mock.MagicMock()
+        mock_vol_type_3.name = "type3"
+        # Simulate openstacksdk Block Storage Proxy: no volume_types attribute;
+        # volume types are listed via c_client.types()
+        mock_cinder_client = mock.Mock(spec=["types"])
+        mock_cinder_client.types.return_value = [
+            mock_vol_type_1,
+            mock_vol_type_2,
+            mock_vol_type_3,
+        ]
+        mock_cinder.return_value = mock_cinder_client
+        storage_classes = self.driver._storageclass_definitions(
+            self.context, self.cluster_obj
+        )
+        self.assertIsInstance(storage_classes, dict)
+        self.assertIsInstance(storage_classes["defaultStorageClass"], dict)
+        self.assertIsInstance(
+            storage_classes["additionalStorageClasses"], list
+        )
+        self.assertEqual(
+            "type3", storage_classes["defaultStorageClass"]["volumeType"]
+        )
+        self.assertEqual(
+            "middle_earth_east",
+            storage_classes["additionalStorageClasses"][0]["availabilityZone"],
+        )
+
+    @mock.patch("magnum.common.clients.OpenStackClients.cinder")
+    def test_get_storage_class_volume_type_not_available_openstacksdk(
+        self, mock_cinder
+    ):
+        CONF.capi_helm.csi_cinder_default_volume_type = "type4"
+        CONF.capi_helm_cluster_labels.csi_cinder_availability_zone = (
+            "middle_earth_east"
+        )
+        mock_vol_type_1 = mock.MagicMock()
+        mock_vol_type_1.name = "type1"
+        mock_vol_type_2 = mock.MagicMock()
+        mock_vol_type_2.name = "type2"
+        mock_vol_type_3 = mock.MagicMock()
+        mock_vol_type_3.name = "type3"
+        # Simulate openstacksdk Block Storage Proxy: no volume_types attribute;
+        # volume types are listed via c_client.types()
+        mock_cinder_client = mock.Mock(spec=["types"])
+        mock_cinder_client.types.return_value = [
+            mock_vol_type_1,
+            mock_vol_type_2,
+            mock_vol_type_3,
+        ]
+        mock_cinder.return_value = mock_cinder_client
+        self.assertRaisesRegex(
+            exception.MagnumException,
+            r"not\sa\svalid\sCinder",
+            self.driver._storageclass_definitions,
+            self.context,
+            self.cluster_obj,
+        )
+
+    @mock.patch("magnum.common.clients.OpenStackClients.cinder")
+    def test_get_storage_class_volume_type_not_defined_openstacksdk(
+        self, mock_cinder
+    ):
+        CONF.capi_helm.csi_cinder_default_volume_type = None
+        CONF.capi_helm_cluster_labels.csi_cinder_availability_zone = (
+            "middle_earth_east"
+        )
+        mock_vol_type_1 = mock.MagicMock()
+        mock_vol_type_1.name = "__TYPE1__"
+        mock_vol_type_2 = mock.MagicMock()
+        mock_vol_type_2.name = "type2"
+        mock_vol_type_3 = mock.MagicMock()
+        mock_vol_type_3.name = "type3"
+        # Simulate openstacksdk Block Storage Proxy: no volume_types attribute;
+        # volume types are listed via c_client.types()
+        mock_cinder_client = mock.Mock(spec=["types"])
+        mock_cinder_client.types.return_value = [
+            mock_vol_type_1,
+            mock_vol_type_2,
+            mock_vol_type_3,
+        ]
         mock_cinder.return_value = mock_cinder_client
         storage_classes = self.driver._storageclass_definitions(
             self.context, self.cluster_obj
@@ -2322,6 +2531,81 @@ class ClusterAPIDriverTest(base.DbTestCase):
         mock_flavor_manager.list.return_value = filtered_flavors
         mock_versioned_nova_client.flavors = mock_flavor_manager
         mock_osc_nova.return_value = mock_versioned_nova_client
+        try:
+            self.driver._validate_allowed_flavor(self.context, 3)
+        except Exception as e:
+            self.fail("Raised exception %s" % e)
+        try:
+            self.driver._validate_allowed_flavor(self.context, "flavor_medium")
+        except Exception as e:
+            self.fail("Raised exception %s" % e)
+
+    @mock.patch("magnum.common.clients.OpenStackClients.nova")
+    def test_validate_allowed_flavors_ram_error_openstacksdk(
+        self, mock_osc_nova
+    ):
+        mock_flavor1 = mock.MagicMock(id=1, vcpus=1)
+        mock_flavor1.name = "flavor_tiny"
+        mock_flavor2 = mock.MagicMock(id=2, vcpus=1)
+        mock_flavor2.name = "flavor_small"
+        mock_flavor3 = mock.MagicMock(id=3, vcpus=4)
+        mock_flavor3.name = "flavor_medium"
+        filtered_flavors = [mock_flavor1, mock_flavor2, mock_flavor3]
+        mock_nova = mock.MagicMock()
+        mock_flavors_sdk = mock.Mock(spec=[])  # no 'list' → openstacksdk path
+        mock_flavors_sdk.return_value = filtered_flavors
+        mock_nova.flavors = mock_flavors_sdk
+        mock_osc_nova.return_value = mock_nova
+        self.assertRaises(
+            exception.MagnumException,
+            self.driver._validate_allowed_flavor,
+            self.context,
+            "DS9",
+        )
+
+    @mock.patch("magnum.common.clients.OpenStackClients.nova")
+    def test_validate_allowed_flavors_vcpu_error_openstacksdk(
+        self, mock_osc_nova
+    ):
+        mock_flavor1 = mock.MagicMock(id=1, vcpus=1)
+        mock_flavor1.name = "flavor_tiny"
+        mock_flavor2 = mock.MagicMock(id=2, vcpus=1)
+        mock_flavor2.name = "flavor_small"
+        mock_flavor3 = mock.MagicMock(id=3, vcpus=4)
+        mock_flavor3.name = "flavor_medium"
+        filtered_flavors = [mock_flavor1, mock_flavor2, mock_flavor3]
+        mock_nova = mock.MagicMock()
+        mock_flavors_sdk = mock.Mock(spec=[])  # no 'list' → openstacksdk path
+        mock_flavors_sdk.return_value = filtered_flavors
+        mock_nova.flavors = mock_flavors_sdk
+        mock_osc_nova.return_value = mock_nova
+        self.assertRaises(
+            exception.MagnumException,
+            self.driver._validate_allowed_flavor,
+            self.context,
+            2,
+        )
+        self.assertRaises(
+            exception.MagnumException,
+            self.driver._validate_allowed_flavor,
+            self.context,
+            "flavor_small",
+        )
+
+    @mock.patch("magnum.common.clients.OpenStackClients.nova")
+    def test_validate_allowed_flavors_ram_ok_openstacksdk(self, mock_osc_nova):
+        mock_flavor1 = mock.MagicMock(id=1, vcpus=1)
+        mock_flavor1.name = "flavor_tiny"
+        mock_flavor2 = mock.MagicMock(id=2, vcpus=1)
+        mock_flavor2.name = "flavor_small"
+        mock_flavor3 = mock.MagicMock(id=3, vcpus=4)
+        mock_flavor3.name = "flavor_medium"
+        filtered_flavors = [mock_flavor1, mock_flavor2, mock_flavor3]
+        mock_nova = mock.MagicMock()
+        mock_flavors_sdk = mock.Mock(spec=[])  # no 'list' → openstacksdk path
+        mock_flavors_sdk.return_value = filtered_flavors
+        mock_nova.flavors = mock_flavors_sdk
+        mock_osc_nova.return_value = mock_nova
         try:
             self.driver._validate_allowed_flavor(self.context, 3)
         except Exception as e:
@@ -2723,6 +3007,572 @@ class ClusterAPIDriverTest(base.DbTestCase):
             self.cluster_obj.nodegroups[0],
         )
 
+    # -------------------------------------------------------------------------
+    # Scale-to-zero validation tests
+    # -------------------------------------------------------------------------
+
+    def test_validate_scale_to_zero_min_zero_allowed(self):
+        """min_node_count=0 is now allowed by the driver (scale to zero)."""
+        self.cluster_obj.labels = dict(
+            auto_scaling_enabled="true", min_node_count=0, max_node_count=5
+        )
+        # Should not raise – the driver allows min=0
+        min_nodes, max_nodes = self.driver._validate_allowed_node_counts(
+            self.cluster_obj, self.cluster_obj.nodegroups[0]
+        )
+        self.assertEqual(0, min_nodes)
+        self.assertEqual(5, max_nodes)
+
+    def test_validate_scale_to_zero_min_negative_rejected(self):
+        """Negative min_node_count is still rejected."""
+        self.cluster_obj.labels = dict(
+            auto_scaling_enabled="true", min_node_count=-1, max_node_count=5
+        )
+        self.assertRaises(
+            exception.NodeGroupInvalidInput,
+            self.driver._validate_allowed_node_counts,
+            self.cluster_obj,
+            self.cluster_obj.nodegroups[0],
+        )
+
+    def test_validate_scale_to_zero_max_lt_min_still_rejected(self):
+        """max < min is still rejected even when min is close to zero."""
+        self.cluster_obj.labels = dict(
+            auto_scaling_enabled="true", min_node_count=2, max_node_count=1
+        )
+        self.assertRaises(
+            exception.NodeGroupInvalidInput,
+            self.driver._validate_allowed_node_counts,
+            self.cluster_obj,
+            self.cluster_obj.nodegroups[0],
+        )
+
+    def test_validate_scale_to_zero_old_chart_rejected(self):
+        """min_node_count=0 with chart < 0.26.0 raises an error."""
+        self.cluster_obj.labels = dict(
+            auto_scaling_enabled="true", min_node_count=0, max_node_count=5
+        )
+        self.cluster_obj.cluster_template.labels["capi_helm_chart_version"] = (
+            "0.25.9"
+        )
+        self.assertRaises(
+            exception.NodeGroupInvalidInput,
+            self.driver._validate_allowed_node_counts,
+            self.cluster_obj,
+            self.cluster_obj.nodegroups[0],
+        )
+
+    def test_validate_scale_to_zero_newer_major_chart_allowed(self):
+        """min_node_count=0 with chart 1.0.0 (major bump) is allowed."""
+        self.cluster_obj.labels = dict(
+            auto_scaling_enabled="true", min_node_count=0, max_node_count=5
+        )
+        self.cluster_obj.cluster_template.labels["capi_helm_chart_version"] = (
+            "1.0.0"
+        )
+        min_nodes, max_nodes = self.driver._validate_allowed_node_counts(
+            self.cluster_obj, self.cluster_obj.nodegroups[0]
+        )
+        self.assertEqual(0, min_nodes)
+        self.assertEqual(5, max_nodes)
+
+    def test_validate_scale_to_zero_prerelease_chart_allowed(self):
+        """min_node_count=0 with chart 0.26.0-alpha.1 is allowed."""
+        self.cluster_obj.labels = dict(
+            auto_scaling_enabled="true", min_node_count=0, max_node_count=5
+        )
+        self.cluster_obj.cluster_template.labels["capi_helm_chart_version"] = (
+            "0.26.0-alpha.1"
+        )
+        min_nodes, max_nodes = self.driver._validate_allowed_node_counts(
+            self.cluster_obj, self.cluster_obj.nodegroups[0]
+        )
+        self.assertEqual(0, min_nodes)
+        self.assertEqual(5, max_nodes)
+
+    @mock.patch.object(driver.Driver, "_update_nodegroup_status")
+    @mock.patch.object(kubernetes.Client, "load")
+    def test_update_worker_nodegroup_status_zero_replicas_running(
+        self, mock_load, mock_update
+    ):
+        """MachineDeployment with 0 replicas in Running phase is READY."""
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+        nodegroup = mock.MagicMock()
+        nodegroup.name = "workers"
+        # A MachineDeployment scaled to 0 reports phase=Running
+        md = {
+            "status": {
+                "phase": "Running",
+                "replicas": 0,
+                "readyReplicas": 0,
+            }
+        }
+        mock_client.get_machine_deployment.return_value = md
+
+        self.driver._update_worker_nodegroup_status(
+            self.cluster_obj, nodegroup
+        )
+
+        mock_update.assert_called_once_with(
+            self.cluster_obj, mock.ANY, driver.NodeGroupState.READY
+        )
+
+    @mock.patch.object(driver.Driver, "_update_nodegroup_status")
+    @mock.patch.object(kubernetes.Client, "load")
+    def test_update_worker_nodegroup_status_zero_replicas_scaling_down(
+        self, mock_load, mock_update
+    ):
+        """ScalingDown phase (transitioning to 0 replicas) is PENDING."""
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+        nodegroup = mock.MagicMock()
+        nodegroup.name = "workers"
+        md = {"status": {"phase": "ScalingDown"}}
+        mock_client.get_machine_deployment.return_value = md
+
+        self.driver._update_worker_nodegroup_status(
+            self.cluster_obj, nodegroup
+        )
+
+        mock_update.assert_called_once_with(
+            self.cluster_obj, mock.ANY, driver.NodeGroupState.PENDING
+        )
+
+    @mock.patch.object(
+        driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
+    )
+    @mock.patch.object(
+        driver.Driver,
+        "_storageclass_definitions",
+        return_value=mock.ANY,
+    )
+    @mock.patch.object(driver.Driver, "_validate_allowed_flavor")
+    @mock.patch.object(neutron, "get_network", autospec=True)
+    @mock.patch.object(
+        driver.Driver, "_ensure_certificate_secrets", autospec=True
+    )
+    @mock.patch.object(driver.Driver, "_create_appcred_secret", autospec=True)
+    @mock.patch.object(kubernetes.Client, "load", autospec=True)
+    @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
+    @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
+    def test_create_cluster_zero_node_count_worker(
+        self,
+        mock_install,
+        mock_image,
+        mock_load,
+        mock_appcred,
+        mock_certs,
+        mock_get_net,
+        mock_validate_allowed_flavor,
+        mock_storageclasses,
+        mock_get_keystone_auth_enabled,
+    ):
+        """Creating a cluster with a worker nodegroup starting at 0 nodes."""
+        self.cluster_obj.labels = {}
+        for ng in self.cluster_obj.nodegroups:
+            if ng.role != "master":
+                ng.node_count = 0
+                ng.save()
+
+        mock_image.return_value = ("imageid1", "1.27.4", "ubuntu")
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+
+        self.driver.create_cluster(self.context, self.cluster_obj, 10)
+
+        helm_install_values = mock_install.call_args[0][3]
+        node_groups = helm_install_values["nodeGroups"]
+        self.assertEqual(1, len(node_groups))
+        worker_ng = node_groups[0]
+        # machineCount=0 must be passed to the Helm chart
+        self.assertEqual(0, worker_ng["machineCount"])
+        # No autoscaling keys when autoscaling is disabled
+        self.assertNotIn("autoscale", worker_ng)
+        self.assertNotIn("machineCountMin", worker_ng)
+        self.assertNotIn("machineCountMax", worker_ng)
+
+    @mock.patch.object(
+        driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
+    )
+    @mock.patch.object(
+        driver.Driver,
+        "_storageclass_definitions",
+        return_value=mock.ANY,
+    )
+    @mock.patch.object(driver.Driver, "_validate_allowed_flavor")
+    @mock.patch.object(neutron, "get_network", autospec=True)
+    @mock.patch.object(
+        driver.Driver, "_ensure_certificate_secrets", autospec=True
+    )
+    @mock.patch.object(driver.Driver, "_create_appcred_secret", autospec=True)
+    @mock.patch.object(kubernetes.Client, "load", autospec=True)
+    @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
+    @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
+    def test_create_cluster_autoscale_min_zero(
+        self,
+        mock_install,
+        mock_image,
+        mock_load,
+        mock_appcred,
+        mock_certs,
+        mock_get_net,
+        mock_validate_allowed_flavor,
+        mock_storageclasses,
+        mock_get_keystone_auth_enabled,
+    ):
+        """Autoscaling with min_node_count=0 passes driver validation.
+
+        Note: the Helm chart (0.10.1) does not yet support machineCountMin=0
+        in autoscaling mode. Users need a chart version that removes this
+        restriction to fully enable autoscaling scale-to-zero.
+        """
+        for ng in self.cluster_obj.nodegroups:
+            if ng.role != "master":
+                ng.node_count = 0
+                ng.save()
+
+        self.cluster_obj.labels = dict(
+            auto_scaling_enabled="true", min_node_count=0, max_node_count=5
+        )
+        mock_image.return_value = ("imageid1", "1.27.4", "ubuntu")
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+
+        self.driver.create_cluster(self.context, self.cluster_obj, 10)
+
+        helm_install_values = mock_install.call_args[0][3]
+        node_groups = helm_install_values["nodeGroups"]
+        self.assertEqual(1, len(node_groups))
+        worker_ng = node_groups[0]
+        # The driver must pass machineCountMin=0 to Helm
+        self.assertEqual("true", worker_ng["autoscale"])
+        self.assertEqual(0, worker_ng["machineCountMin"])
+        self.assertEqual(5, worker_ng["machineCountMax"])
+
+    @mock.patch.object(
+        driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
+    )
+    @mock.patch.object(
+        driver.Driver,
+        "_storageclass_definitions",
+        return_value=mock.ANY,
+    )
+    @mock.patch.object(driver.Driver, "_validate_allowed_flavor")
+    @mock.patch.object(neutron, "get_network", autospec=True)
+    @mock.patch.object(
+        driver.Driver, "_ensure_certificate_secrets", autospec=True
+    )
+    @mock.patch.object(driver.Driver, "_create_appcred_secret", autospec=True)
+    @mock.patch.object(kubernetes.Client, "load", autospec=True)
+    @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
+    @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
+    def test_scale_from_zero_to_n_workers(
+        self,
+        mock_install,
+        mock_image,
+        mock_load,
+        mock_appcred,
+        mock_certs,
+        mock_get_net,
+        mock_validate_allowed_flavor,
+        mock_storageclasses,
+        mock_get_keystone_auth_enabled,
+    ):
+        """Resize a worker nodegroup from 0 to N nodes (scale from zero)."""
+        self.cluster_obj.labels = {}
+        # Simulate the conductor having already updated node_count to 3
+        for ng in self.cluster_obj.nodegroups:
+            if ng.role != "master":
+                ng.node_count = 3
+                ng.save()
+
+        mock_image.return_value = ("imageid1", "1.27.4", "ubuntu")
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+
+        self.driver.resize_cluster(
+            self.context, self.cluster_obj, None, 3, None
+        )
+
+        helm_install_values = mock_install.call_args[0][3]
+        node_groups = helm_install_values["nodeGroups"]
+        self.assertEqual(1, len(node_groups))
+        self.assertEqual(3, node_groups[0]["machineCount"])
+
+    @mock.patch.object(
+        driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
+    )
+    @mock.patch.object(
+        driver.Driver,
+        "_storageclass_definitions",
+        return_value=mock.ANY,
+    )
+    @mock.patch.object(driver.Driver, "_validate_allowed_flavor")
+    @mock.patch.object(neutron, "get_network", autospec=True)
+    @mock.patch.object(
+        driver.Driver, "_ensure_certificate_secrets", autospec=True
+    )
+    @mock.patch.object(driver.Driver, "_create_appcred_secret", autospec=True)
+    @mock.patch.object(kubernetes.Client, "load", autospec=True)
+    @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
+    @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
+    def test_update_nodegroup_to_zero_node_count(
+        self,
+        mock_install,
+        mock_image,
+        mock_load,
+        mock_appcred,
+        mock_certs,
+        mock_get_net,
+        mock_validate_allowed_flavor,
+        mock_storageclasses,
+        mock_get_keystone_auth_enabled,
+    ):
+        """update_nodegroup with node_count=0 passes machineCount=0 to Helm."""
+        self.cluster_obj.labels = {}
+        worker_ng = None
+        for ng in self.cluster_obj.nodegroups:
+            if ng.role != "master":
+                worker_ng = ng
+                ng.node_count = 0
+                ng.save()
+
+        mock_image.return_value = ("imageid1", "1.27.4", "ubuntu")
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+
+        self.driver.update_nodegroup(self.context, self.cluster_obj, worker_ng)
+
+        helm_install_values = mock_install.call_args[0][3]
+        node_groups = helm_install_values["nodeGroups"]
+        self.assertEqual(1, len(node_groups))
+        self.assertEqual(0, node_groups[0]["machineCount"])
+
+    @mock.patch.object(
+        driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
+    )
+    @mock.patch.object(
+        driver.Driver,
+        "_storageclass_definitions",
+        return_value=mock.ANY,
+    )
+    @mock.patch.object(driver.Driver, "_validate_allowed_flavor")
+    @mock.patch.object(neutron, "get_network", autospec=True)
+    @mock.patch.object(
+        driver.Driver, "_ensure_certificate_secrets", autospec=True
+    )
+    @mock.patch.object(driver.Driver, "_create_appcred_secret", autospec=True)
+    @mock.patch.object(kubernetes.Client, "load", autospec=True)
+    @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
+    @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
+    def test_create_nodegroup_zero_count_allowed(
+        self,
+        mock_install,
+        mock_image,
+        mock_load,
+        mock_appcred,
+        mock_certs,
+        mock_get_net,
+        mock_validate_allowed_flavor,
+        mock_storageclasses,
+        mock_get_keystone_auth_enabled,
+    ):
+        """create_nodegroup with node_count=0 is allowed (scale from zero)."""
+        self.cluster_obj.labels = {}
+        new_ng = obj_utils.create_test_nodegroup(
+            self.context,
+            uuid=uuid4(),
+            id=789,
+            name="zero-start-group",
+            node_count=0,
+        )
+        self.cluster_obj.nodegroups.append(new_ng)
+        mock_image.return_value = ("imageid1", "1.27.4", "ubuntu")
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+
+        self.driver.create_nodegroup(self.context, self.cluster_obj, new_ng)
+
+        helm_install_values = mock_install.call_args[0][3]
+        node_groups = helm_install_values["nodeGroups"]
+        zero_ngs = [ng for ng in node_groups if ng["name"] == new_ng.name]
+        self.assertEqual(1, len(zero_ngs))
+        self.assertEqual(0, zero_ngs[0]["machineCount"])
+
+    @mock.patch.object(
+        driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
+    )
+    @mock.patch.object(
+        driver.Driver,
+        "_storageclass_definitions",
+        return_value=mock.ANY,
+    )
+    @mock.patch.object(driver.Driver, "_validate_allowed_flavor")
+    @mock.patch.object(neutron, "get_network", autospec=True)
+    @mock.patch.object(
+        driver.Driver, "_ensure_certificate_secrets", autospec=True
+    )
+    @mock.patch.object(driver.Driver, "_create_appcred_secret", autospec=True)
+    @mock.patch.object(kubernetes.Client, "load", autospec=True)
+    @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
+    @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
+    def test_autoscale_extra_nodegroup_min_zero(
+        self,
+        mock_install,
+        mock_image,
+        mock_load,
+        mock_appcred,
+        mock_certs,
+        mock_get_net,
+        mock_validate_allowed_flavor,
+        mock_storageclasses,
+        mock_get_keystone_auth_enabled,
+    ):
+        """Autoscaling extra nodegroup with min_node_count=0 is forwarded."""
+        self.cluster_obj.labels = {"auto_scaling_enabled": "true"}
+
+        zero_min_ng = obj_utils.create_test_nodegroup(
+            self.context,
+            uuid=uuid4(),
+            id=321,
+            name="zero-min-group",
+            node_count=0,
+            min_node_count=0,
+            max_node_count=4,
+        )
+        self.cluster_obj.nodegroups.append(zero_min_ng)
+
+        mock_image.return_value = ("imageid1", "1.27.4", "ubuntu")
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+
+        self.driver.create_cluster(self.context, self.cluster_obj, 10)
+
+        helm_install_values = mock_install.call_args[0][3]
+        node_groups = helm_install_values["nodeGroups"]
+        zero_ngs = [ng for ng in node_groups if ng["name"] == zero_min_ng.name]
+        self.assertEqual(1, len(zero_ngs))
+        ng = zero_ngs[0]
+        self.assertEqual("true", ng["autoscale"])
+        self.assertEqual(0, ng["machineCountMin"])
+        self.assertEqual(4, ng["machineCountMax"])
+
+    @mock.patch.object(
+        driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
+    )
+    @mock.patch.object(
+        driver.Driver,
+        "_storageclass_definitions",
+        return_value=mock.ANY,
+    )
+    @mock.patch.object(driver.Driver, "_validate_allowed_flavor")
+    @mock.patch.object(neutron, "get_network", autospec=True)
+    @mock.patch.object(
+        driver.Driver, "_ensure_certificate_secrets", autospec=True
+    )
+    @mock.patch.object(driver.Driver, "_create_appcred_secret", autospec=True)
+    @mock.patch.object(kubernetes.Client, "load", autospec=True)
+    @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
+    @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
+    def test_autoscale_extra_nodegroup_min_zero_equal_max_no_autoscale(
+        self,
+        mock_install,
+        mock_image,
+        mock_load,
+        mock_appcred,
+        mock_certs,
+        mock_get_net,
+        mock_validate_allowed_flavor,
+        mock_storageclasses,
+        mock_get_keystone_auth_enabled,
+    ):
+        """Extra nodegroup with min=max=0 disables autoscaling (min==max)."""
+        self.cluster_obj.labels = {"auto_scaling_enabled": "true"}
+
+        # min == max → autoscaling disabled for this nodegroup
+        zero_ng = obj_utils.create_test_nodegroup(
+            self.context,
+            uuid=uuid4(),
+            id=654,
+            name="zero-zero-group",
+            node_count=0,
+            min_node_count=0,
+            max_node_count=0,
+        )
+        self.cluster_obj.nodegroups.append(zero_ng)
+
+        mock_image.return_value = ("imageid1", "1.27.4", "ubuntu")
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+
+        self.driver.create_cluster(self.context, self.cluster_obj, 10)
+
+        helm_install_values = mock_install.call_args[0][3]
+        node_groups = helm_install_values["nodeGroups"]
+        zero_ngs = [ng for ng in node_groups if ng["name"] == zero_ng.name]
+        self.assertEqual(1, len(zero_ngs))
+        ng = zero_ngs[0]
+        # min == max → autoscale args NOT emitted
+        self.assertNotIn("autoscale", ng)
+        self.assertNotIn("machineCountMin", ng)
+        self.assertEqual(0, ng["machineCount"])
+
+    @mock.patch.object(
+        driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
+    )
+    @mock.patch.object(
+        driver.Driver,
+        "_storageclass_definitions",
+        return_value=mock.ANY,
+    )
+    @mock.patch.object(driver.Driver, "_validate_allowed_flavor")
+    @mock.patch.object(neutron, "get_network", autospec=True)
+    @mock.patch.object(
+        driver.Driver, "_ensure_certificate_secrets", autospec=True
+    )
+    @mock.patch.object(driver.Driver, "_create_appcred_secret", autospec=True)
+    @mock.patch.object(kubernetes.Client, "load", autospec=True)
+    @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
+    @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
+    def test_default_nodegroup_autoscale_min_zero_max_n(
+        self,
+        mock_install,
+        mock_image,
+        mock_load,
+        mock_appcred,
+        mock_certs,
+        mock_get_net,
+        mock_validate_allowed_flavor,
+        mock_storageclasses,
+        mock_get_keystone_auth_enabled,
+    ):
+        """Default nodegroup: autoscaling with min=0 via labels."""
+        self.cluster_obj.labels = dict(
+            auto_scaling_enabled="true", min_node_count=0, max_node_count=5
+        )
+        for ng in self.cluster_obj.nodegroups:
+            if ng.role != "master":
+                ng.node_count = 0
+                ng.save()
+
+        mock_image.return_value = ("imageid1", "1.27.4", "ubuntu")
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+
+        self.driver.create_cluster(self.context, self.cluster_obj, 10)
+
+        helm_install_values = mock_install.call_args[0][3]
+        node_groups = helm_install_values["nodeGroups"]
+        default_ng = next(
+            ng
+            for ng in node_groups
+            if ng["name"] == self.cluster_obj.default_ng_worker.name
+        )
+        self.assertEqual("true", default_ng["autoscale"])
+        self.assertEqual(0, default_ng["machineCountMin"])
+        self.assertEqual(5, default_ng["machineCountMax"])
+
     @mock.patch.object(
         driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
     )
@@ -2980,12 +3830,10 @@ class ClusterAPIDriverTest(base.DbTestCase):
         )
 
         # Check extra autoscaling node group values
-        # NOTE: CAPO doesn't support scale to zero so
-        # min node count should be max(1, ng.min_node_count)
         ng = helm_values_autoscale_nodegroup[0]
         self.assertEqual(ng["autoscale"], "true")
         self.assertEqual(
-            ng["machineCountMin"], max(1, auto_scale_nodegroup.min_node_count)
+            ng["machineCountMin"], auto_scale_nodegroup.min_node_count
         )
         self.assertEqual(
             ng["machineCountMax"], auto_scale_nodegroup.max_node_count
@@ -3497,3 +4345,215 @@ class ClusterAPIDriverTest(base.DbTestCase):
             fields.ClusterStatus.UPDATE_FAILED, self.cluster_obj.status
         )
         self.assertIsNotNone(self.cluster_obj.status_reason)
+
+
+class TestClusterLabelRegistry(base.DbTestCase):
+    """Enforce that every label key used in the driver is registered."""
+
+    def test_all_label_calls_use_registered_keys(self):
+        import ast
+        import inspect
+
+        from magnum_capi_helm import conf as capi_conf
+        from magnum_capi_helm import driver as capi_driver
+
+        regular_label_names = set(
+            opt.name for opt in capi_conf.capi_helm_cluster_labels_opts
+        )
+        deprecated_label_names = []
+        for opt in capi_conf.capi_helm_cluster_labels_opts:
+            for dep_opt in opt.deprecated_opts:
+                deprecated_label_names.append(dep_opt.name)
+        registered = frozenset(
+            regular_label_names.union(set(deprecated_label_names))
+        )
+
+        source = inspect.getsource(capi_driver)
+        tree = ast.parse(source)
+
+        label_methods = {
+            "_label",
+            "_get_label_bool",
+            "_get_label_int",
+            "_get_label_csv",
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (
+                isinstance(func, ast.Attribute) and func.attr in label_methods
+            ):
+                continue
+            # second positional arg (index 1) is the label key
+            if len(node.args) < 2:
+                continue
+            key_node = node.args[1]
+            # Variable keys (e.g. inside _get_label_bool forwarding to
+            # _label) are validated at runtime; only check string literals.
+            if not isinstance(key_node, ast.Constant):
+                continue
+            self.assertIn(
+                key_node.value,
+                registered,
+                f"Label '{key_node.value}' used at line {node.lineno} "
+                "is not registered in capi_helm_cluster_labels_opts. "
+                "Add it to conf.py before using it in the driver.",
+            )
+
+
+class TestValidateCidrNoOverlap(base.DbTestCase):
+    def setUp(self):
+        super().setUp()
+        self.driver = driver.Driver()
+        self.cluster_obj = obj_utils.create_test_cluster(
+            self.context,
+            name="cidr-test-cluster",
+            master_flavor_id="flavor_small",
+            flavor_id="flavor_medium",
+        )
+
+        mock_nc = mock.MagicMock()
+        del mock_nc.list_subnets
+        mock_nc.subnets.return_value = []
+        patcher_clients = mock.patch("magnum.common.clients.OpenStackClients")
+        mock_osc = patcher_clients.start()
+        mock_osc.return_value.neutron.return_value = mock_nc
+        self.mock_nc = mock_nc
+        self.addCleanup(patcher_clients.stop)
+
+        patcher_fixed = mock.patch.object(
+            driver.Driver,
+            "_get_fixed_network_id",
+            return_value=None,
+        )
+        self.mock_fixed_net = patcher_fixed.start()
+        self.addCleanup(patcher_fixed.stop)
+
+        patcher_ext = mock.patch(
+            "magnum.common.neutron.get_external_network_id",
+            return_value=None,
+        )
+        self.mock_ext_net = patcher_ext.start()
+        self.addCleanup(patcher_ext.stop)
+
+    def _make_subnet(self, cidr, name="test-subnet"):
+        subnet = mock.MagicMock()
+        subnet.cidr = cidr
+        subnet.name = name
+        return subnet
+
+    def _set_labels(self, pod_cidr, service_cidr):
+        self.cluster_obj.labels = {
+            "pod_network_cidr": pod_cidr,
+            "service_network_cidr": service_cidr,
+        }
+
+    def test_no_overlap_passes(self):
+        self._set_labels("10.100.0.0/16", "10.96.0.0/16")
+        self.driver._validate_cidr_no_overlap(self.context, self.cluster_obj)
+
+    def test_no_fixed_network(self):
+        self._set_labels("10.100.0.0/16", "10.96.0.0/16")
+        self.driver._validate_cidr_no_overlap(self.context, self.cluster_obj)
+        self.mock_nc.subnets.assert_not_called()
+
+    def test_no_external_network(self):
+        self.mock_fixed_net.return_value = "fixed-net-uuid"
+        self._set_labels("10.100.0.0/16", "10.96.0.0/16")
+        self.driver._validate_cidr_no_overlap(self.context, self.cluster_obj)
+
+    def test_invalid_pod_cidr(self):
+        self._set_labels("not-a-cidr", "10.96.0.0/16")
+        self.assertRaises(
+            exception.MagnumException,
+            self.driver._validate_cidr_no_overlap,
+            self.context,
+            self.cluster_obj,
+        )
+
+    def test_invalid_service_cidr(self):
+        self._set_labels("10.100.0.0/16", "not-a-cidr")
+        self.assertRaises(
+            exception.MagnumException,
+            self.driver._validate_cidr_no_overlap,
+            self.context,
+            self.cluster_obj,
+        )
+
+    def test_pod_service_overlap(self):
+        self._set_labels("10.96.0.0/16", "10.96.0.0/16")
+        self.assertRaises(
+            exception.MagnumException,
+            self.driver._validate_cidr_no_overlap,
+            self.context,
+            self.cluster_obj,
+        )
+
+    def test_pod_overlaps_fixed_network_subnet(self):
+        self.mock_fixed_net.return_value = "fixed-net-uuid"
+        self._set_labels("192.168.0.0/16", "10.96.0.0/16")
+        self.mock_nc.subnets.return_value = [
+            self._make_subnet("192.168.1.0/24", "fixed-subnet")
+        ]
+        self.assertRaises(
+            exception.MagnumException,
+            self.driver._validate_cidr_no_overlap,
+            self.context,
+            self.cluster_obj,
+        )
+
+    def test_service_overlaps_fixed_network_subnet(self):
+        self.mock_fixed_net.return_value = "fixed-net-uuid"
+        self._set_labels("10.100.0.0/16", "192.168.0.0/16")
+        self.mock_nc.subnets.return_value = [
+            self._make_subnet("192.168.1.0/24", "fixed-subnet")
+        ]
+        self.assertRaises(
+            exception.MagnumException,
+            self.driver._validate_cidr_no_overlap,
+            self.context,
+            self.cluster_obj,
+        )
+
+    def test_pod_overlaps_external_network_subnet(self):
+        self.mock_ext_net.return_value = "ext-net-uuid"
+        self._set_labels("172.24.0.0/16", "10.96.0.0/16")
+        self.mock_nc.subnets.return_value = [
+            self._make_subnet("172.24.4.0/24", "ext-subnet")
+        ]
+        self.assertRaises(
+            exception.MagnumException,
+            self.driver._validate_cidr_no_overlap,
+            self.context,
+            self.cluster_obj,
+        )
+
+    def test_service_overlaps_external_network_subnet(self):
+        self.mock_ext_net.return_value = "ext-net-uuid"
+        self._set_labels("10.100.0.0/16", "172.24.0.0/16")
+        self.mock_nc.subnets.return_value = [
+            self._make_subnet("172.24.4.0/24", "ext-subnet")
+        ]
+        self.assertRaises(
+            exception.MagnumException,
+            self.driver._validate_cidr_no_overlap,
+            self.context,
+            self.cluster_obj,
+        )
+
+    def test_subnet_invalid_cidr_skipped(self):
+        self.mock_fixed_net.return_value = "fixed-net-uuid"
+        self._set_labels("10.100.0.0/16", "10.96.0.0/16")
+        self.mock_nc.subnets.return_value = [
+            self._make_subnet("not-a-cidr", "bad-subnet")
+        ]
+        self.driver._validate_cidr_no_overlap(self.context, self.cluster_obj)
+
+    def test_subnet_ipv6_skipped_for_ipv4_pods(self):
+        self.mock_fixed_net.return_value = "fixed-net-uuid"
+        self._set_labels("10.100.0.0/16", "10.96.0.0/16")
+        self.mock_nc.subnets.return_value = [
+            self._make_subnet("fd00::/64", "ipv6-subnet")
+        ]
+        self.driver._validate_cidr_no_overlap(self.context, self.cluster_obj)

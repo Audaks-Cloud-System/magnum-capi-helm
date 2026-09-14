@@ -11,7 +11,8 @@
 set -ex
 
 OPENSTACK_VERSION="${OPENSTACK_VERSION:-master}"
-
+K8S_VERSION="${K8S_VERSION:-1.34.7}"
+KUBE_VERSION="${KUBE_VERSION:-v${K8S_VERSION}}"
 # Set up the packages we need. Ubuntu package manager is assumed.
 sudo apt-get update
 sudo apt-get install git vim apparmor apparmor-utils jq -y
@@ -85,7 +86,29 @@ enable_plugin neutron https://opendev.org/openstack/neutron $OPENSTACK_VERSION
 enable_service q-trunk
 enable_service q-dns
 #enable_service q-qos
-FIXED_RANGE=10.1.0.0/24
+
+# Zuul devstack_localrc
+CONTAINER_ENGINE=crio
+CRIO_VERSION=1.32.1
+DISABLE_AMP_IMAGE_BUILD=True
+ETCD_VERSION=v3.6.11
+ETCD_SHA256=8756f7a4eaf921668a83de0bf13c0f65cae9186a165696e3ae8396afe6f557ed
+FIXED_RANGE=10.1.0.0/20
+K8S_CAPI_VERSION=v1.10.4
+K8S_CAPO_VERSION=v0.11.3
+K8S_VERSION=$K8S_VERSION
+K8S_TOKEN=0cvq6p.k454yiandj1tjxxv
+K8S_COPY_KUBECONFIG_PATH=/etc/magnum/kubeconfig
+MAGNUM_GUEST_IMAGE_URL=https://github.com/vexxhost/capo-image-elements/releases/download/2026.04-5/ubuntu-24.04-$KUBE_VERSION.qcow2
+MAGNUM_GUEST_IMAGE_EXTRA_PROPERTIES="--property kube_version=$KUBE_VERSION"
+OCTAVIA_NODE=api
+
+# From magnum-capi-helm Zuul devstack_plugins/devstack_services
+enable_plugin devstack-plugin-container https://opendev.org/openstack/devstack-plugin-container
+enable_service etcd3
+enable_service container
+enable_service k8s-master
+enable_service k8s-capi
 
 # Enable octavia tempest plugin tests
 # NOTE: Doesn't follow standard OS branch naming conventions
@@ -146,7 +169,7 @@ DISABLE_AMP_IMAGE_BUILD=True
 enable_plugin barbican https://opendev.org/openstack/barbican $OPENSTACK_VERSION
 enable_plugin octavia https://opendev.org/openstack/octavia $OPENSTACK_VERSION
 enable_plugin octavia-dashboard https://opendev.org/openstack/octavia-dashboard $OPENSTACK_VERSION
-LIBS_FROM_GIT+=python-octaviaclient
+# LIBS_FROM_GIT+=python-octaviaclient
 enable_service octavia
 enable_service o-api
 enable_service o-hk
@@ -155,39 +178,38 @@ enable_service o-cw
 enable_service o-hm
 
 # OVN octavia provider plugin
-enable_plugin ovn-octavia-provider https://opendev.org/openstack/ovn-octavia-provider $OPENSTACK_VERSION
+enable_plugin ovn-octavia-provider https://opendev.org/openstack/ovn-octavia-provider
 
 # Magnum
-enable_plugin magnum https://opendev.org/openstack/magnum $OPENSTACK_VERSION
+enable_plugin magnum https://opendev.org/openstack/magnum
+enable_plugin magnum-capi-helm https://opendev.org/openstack/magnum-capi-helm
 
-[[post-config|$NOVA_CONF]]
+[[post-config|\$MAGNUM_CONF]]
+[capi_helm]
+default_helm_chart_version = 0.23.0
+
+[[post-config|\$NOVA_CONF]]
 [scheduler]
 discover_hosts_in_cells_interval = 2
+
+[[test-config|\$TEMPEST_CONFIG]]
+[magnum]
+image_id = ubuntu-24.04-$KUBE_VERSION
+labels = octavia_provider:ovn,master_lb_floating_ip_enabled:true
 EOF
 
 # Fix permissions on current tty so screens can attach
 sudo chmod go+rw `tty`
 
+# Fix CoreDNS loop caused by systemd-resolved stub resolver
+if [ -f /run/systemd/resolve/resolv.conf ]; then
+    sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+fi
+
 # Stack that stack!
 /opt/stack/stack.sh
 
-#
-# Install this checkout and restart the Magnum services
-#
-SELF_PATH="$(realpath "${BASH_SOURCE[0]:-${(%):-%x}}")"
-REPO_PATH="$(dirname "$(dirname "$(dirname "$SELF_PATH")")")"
-python3 -m pip install -e "$REPO_PATH"
 sudo systemctl restart devstack@magnum-api devstack@magnum-cond
-
-new_path="/home/ubuntu/.local/bin"
-
-source ~/.bashrc
-
-# Check if the path is already in the PATH variable
-if [[ ":$PATH:" != *":$new_path:"* ]]; then
-  # If it's not in the PATH, add it
-  echo 'export PATH="$PATH:'"$new_path"'"' >> ~/.bashrc
-fi
 
 # Get latest capi-helm-charts tag
 LATEST_TAG=$(curl -fsL https://api.github.com/repos/azimuth-cloud/capi-helm-charts/tags | jq -r '.[0].name')
@@ -195,80 +217,7 @@ LATEST_TAG=$(curl -fsL https://api.github.com/repos/azimuth-cloud/capi-helm-char
 DEPENDENCIES_JSON=$(curl -fsL https://github.com/azimuth-cloud/capi-helm-charts/releases/download/$LATEST_TAG/dependencies.json)
 
 # Parse JSON into bash variables
-ADDON_PROVIDER=$(echo $DEPENDENCIES_JSON | jq -r '.["addon-provider"]')
 AZIMUTH_IMAGES_TAG=$(echo $DEPENDENCIES_JSON | jq -r '.["azimuth-images"]')
-CLUSTER_API=$(echo $DEPENDENCIES_JSON | jq -r '.["cluster-api"]')
-CLUSTER_API_JANITOR_OPENSTACK=$(echo $DEPENDENCIES_JSON | jq -r '.["cluster-api-janitor-openstack"]')
-CLUSTER_API_PROVIDER_OPENSTACK=$(echo $DEPENDENCIES_JSON | jq -r '.["cluster-api-provider-openstack"]')
-CERT_MANAGER=$(echo $DEPENDENCIES_JSON | jq -r '.["cert-manager"]')
-HELM=$(echo $DEPENDENCIES_JSON | jq -r '.["helm"]')
-SONOBUOY=$(echo $DEPENDENCIES_JSON | jq -r '.["sonobuoy"]')
-
-# # Install `kubectl` CLI
-curl -fsLo /tmp/kubectl "https://dl.k8s.io/release/$(curl -fsL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-sudo install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
-
-# Install k3s
-curl -fsL https://get.k3s.io | sudo bash -s - --disable traefik
-
-# copy kubeconfig file into standard location
-mkdir -p $HOME/.kube
-sudo cp /etc/rancher/k3s/k3s.yaml $HOME/.kube/config
-sudo chown $USER $HOME/.kube/config
-
-# Install helm
-curl -fsL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-
-# Install cert manager
-{
-    helm upgrade cert-manager cert-manager \
-      --install \
-      --namespace cert-manager \
-      --create-namespace \
-      --repo https://charts.jetstack.io \
-      --version $CERT_MANAGER \
-      --set installCRDs=true \
-      --wait \
-      --timeout 10m
-} || {
-    kubectl -n cert-manager get pods |  awk '$1 && $1!="NAME" { print $1 }' | xargs -n1 kubectl -n cert-manager logs
-    exit
-}
-
-# Install clusterctl
-curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/$CLUSTER_API/clusterctl-linux-amd64 -o clusterctl
-sudo install -o root -g root -m 0755 clusterctl /usr/local/bin/clusterctl
-
-# Install Cluster API resources
-# using the matching tested values here:
-# https://github.com/azimuth-cloud/capi-helm-charts/blob/main/dependencies.json
-clusterctl init \
-    --core cluster-api:$CLUSTER_API \
-    --bootstrap kubeadm:$CLUSTER_API \
-    --control-plane kubeadm:$CLUSTER_API \
-    --infrastructure openstack:$CLUSTER_API_PROVIDER_OPENSTACK
-
-# Install addon manager
-helm upgrade cluster-api-addon-provider cluster-api-addon-provider \
-  --install \
-  --repo https://azimuth-cloud.github.io/cluster-api-addon-provider \
-  --version $ADDON_PROVIDER \
-  --namespace capi-addon-system \
-  --create-namespace \
-  --wait \
-  --timeout 10m
-
-# Install janitor
-helm upgrade cluster-api-janitor-openstack cluster-api-janitor-openstack \
-  --install \
-  --repo https://azimuth-cloud.github.io/cluster-api-janitor-openstack \
-  --version $CLUSTER_API_JANITOR_OPENSTACK \
-  --namespace capi-janitor-system \
-  --create-namespace \
-  --wait \
-  --timeout 10m
-
-pip install python-magnumclient
 
 # Configure OpenStack auth
 source /opt/stack/openrc admin admin
@@ -308,10 +257,10 @@ for K8S_IMAGE_KEY in $K8S_IMAGE_KEYS; do
 capi_helm_chart_version="$LATEST_TAG",\
 octavia_provider=ovn,\
 monitoring_enabled=true,\
-kube_dashboard_enabled=true \
+kube_dashboard_enabled=false \
       --external-network public \
-      --master-flavor ds2G20 \
-      --flavor ds2G20 \
+      --master-flavor ds4G \
+      --flavor ds4G \
       --public \
       --master-lb-enabled
 done
@@ -323,3 +272,4 @@ done
 #    --node-count 2
 #  openstack coe cluster list
 #  openstack coe cluster config devstacktest
+
