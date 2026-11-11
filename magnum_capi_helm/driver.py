@@ -40,6 +40,10 @@ LOG = logging.getLogger(__name__)
 CONF = conf.CONF
 NODE_GROUP_ROLE_CONTROLLER = "master"
 SCALE_TO_ZERO_MIN_CHART_VERSION = (0, 26, 0)
+# openstack-cluster chart 0.24.0 renamed apiServer.allowedCidrs to
+# apiServer.allowedCIDRs (the OpenStackCluster v1beta1 field). Older charts
+# render the old field name, which CAPO >= v0.10 ignores.
+ALLOWED_CIDRS_MIN_CHART_VERSION = (0, 24, 0)
 
 
 def _gather_label_names():
@@ -1286,8 +1290,27 @@ class Driver(driver.Driver):
             "api_master_lb_allowed_cidrs",
             CONF.capi_helm_cluster_labels.api_master_lb_allowed_cidrs,
         )
+        if not cidrs:
+            # Magnum's own label name, as used by the Heat drivers
+            cidrs = self._get_label_csv(
+                cluster, "master_lb_allowed_cidrs", ""
+            )
+        cidrs = [c for c in cidrs if c]
+        if not cidrs:
+            return False
+        # Keep the management cluster (Cluster API, autoscaler) allowed
+        for extra in CONF.capi_helm.api_master_lb_extra_allowed_cidrs:
+            if extra and extra not in cidrs:
+                cidrs.append(extra)
         LOG.debug(f"CIDR list {cidrs}")
-        return cidrs or False
+        return cidrs
+
+    def _chart_supports_allowed_cidrs(self, cluster):
+        version = self._get_chart_version(cluster)
+        return (
+            self._parse_chart_version(version)
+            >= ALLOWED_CIDRS_MIN_CHART_VERSION
+        )
 
     def _storageclass_definitions(self, context, cluster):
         """Query cinder API to retrieve list of available volume types.
@@ -1628,8 +1651,22 @@ class Driver(driver.Driver):
 
             api_lb_allowed_cidrs = self._get_allowed_cidrs(cluster)
             if isinstance(api_lb_allowed_cidrs, list):
+                if not self._chart_supports_allowed_cidrs(cluster):
+                    LOG.warning(
+                        "Cluster %s sets an API allow list, but chart "
+                        "version %s renders apiServer.allowedCidrs, which "
+                        "Cluster API Provider OpenStack ignores: the API "
+                        "stays open to all. Use chart >= %s.",
+                        cluster.uuid,
+                        self._get_chart_version(cluster),
+                        ".".join(map(str, ALLOWED_CIDRS_MIN_CHART_VERSION)),
+                    )
+                # allowedCIDRs: chart >= 0.24.0, allowedCidrs: older charts
                 allowed_cidrs_config = {
-                    "apiServer": {"allowedCidrs": api_lb_allowed_cidrs}
+                    "apiServer": {
+                        "allowedCIDRs": api_lb_allowed_cidrs,
+                        "allowedCidrs": api_lb_allowed_cidrs,
+                    }
                 }
                 values = helm.mergeconcat(values, allowed_cidrs_config)
 

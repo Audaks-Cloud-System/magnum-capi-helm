@@ -141,6 +141,18 @@ capi_helm_opts = [
             "is already in progress for the same cluster."
         ),
     ),
+    cfg.ListOpt(
+        "api_master_lb_extra_allowed_cidrs",
+        default=[],
+        help=(
+            "CIDRs always added to a cluster's API load balancer allow list "
+            "when the cluster sets one (label api_master_lb_allowed_cidrs). "
+            "Put the source address of the Cluster API management cluster "
+            "here, otherwise the allow list locks Cluster API and the "
+            "autoscaler out of the workload cluster. Not used when the "
+            "cluster sets no allow list (all CIDRs allowed)."
+        ),
+    ),
     cfg.IntOpt(
         "helm_timeout",
         default=300,
@@ -351,9 +363,16 @@ capi_helm_cluster_labels_opts = [
     cfg.StrOpt(
         "api_master_lb_allowed_cidrs",
         default="",
+        # Magnum's own label name (Heat drivers, docs, dashboards)
+        deprecated_opts=[
+            cfg.DeprecatedOpt(
+                "master_lb_allowed_cidrs", group="capi_helm_cluster_labels"
+            )
+        ],
         help=(
             "Comma-separated list of CIDRs allowed to reach the API load "
-            "balancer. Empty means all CIDRs are allowed."
+            "balancer. Empty means all CIDRs are allowed. The Magnum label "
+            "master_lb_allowed_cidrs is accepted too."
         ),
     ),
     cfg.StrOpt(

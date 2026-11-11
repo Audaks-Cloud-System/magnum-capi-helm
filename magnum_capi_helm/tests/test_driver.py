@@ -2998,6 +2998,232 @@ class ClusterAPIDriverTest(base.DbTestCase):
             helm_install_values["apiServer"]["allowedCidrs"], cidr_list
         )
 
+    @mock.patch.object(
+        driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
+    )
+    @mock.patch.object(
+        driver.Driver,
+        "_storageclass_definitions",
+        return_value=mock.ANY,
+    )
+    @mock.patch.object(driver.Driver, "_validate_allowed_flavor")
+    @mock.patch.object(neutron, "get_network", autospec=True)
+    @mock.patch.object(
+        driver.Driver, "_ensure_certificate_secrets", autospec=True
+    )
+    @mock.patch.object(driver.Driver, "_create_appcred_secret", autospec=True)
+    @mock.patch.object(helm.HelmLock, "renew", return_value=None)
+    @mock.patch.object(helm.HelmLock, "_acquire_lock", return_value=True)
+    @mock.patch.object(kubernetes.Client, "load", autospec=True)
+    @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
+    @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
+    def test_create_cluster_api_lb_allowed_cidrs_chart_key(
+        self,
+        mock_install,
+        mock_image,
+        mock_load,
+        mock_helm_lock,
+        mock_renew,
+        mock_appcred,
+        mock_certs,
+        mock_get_net,
+        mock_validate_allowed_flavor,
+        mock_storageclasses,
+        mock_get_keystone_auth_enabled,
+    ):
+        cidrs = "192.168.0.0/16,10.0.0.0/8,123.123.123.123/32"
+        self._set_cluster_test_labels(dict(api_master_lb_allowed_cidrs=cidrs))
+        mock_image.return_value = (
+            "imageid1",
+            "1.27.4",
+            "ubuntu",
+        )
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+
+        self.driver.create_cluster(self.context, self.cluster_obj, 10)
+        helm_install_values = mock_install.call_args[0][3]
+        # chart >= 0.24.0 reads allowedCIDRs, older charts allowedCidrs
+        self.assertEqual(
+            helm_install_values["apiServer"]["allowedCIDRs"],
+            cidrs.split(","),
+        )
+        self.assertEqual(
+            helm_install_values["apiServer"]["allowedCidrs"],
+            cidrs.split(","),
+        )
+
+    @mock.patch.object(
+        driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
+    )
+    @mock.patch.object(
+        driver.Driver,
+        "_storageclass_definitions",
+        return_value=mock.ANY,
+    )
+    @mock.patch.object(driver.Driver, "_validate_allowed_flavor")
+    @mock.patch.object(neutron, "get_network", autospec=True)
+    @mock.patch.object(
+        driver.Driver, "_ensure_certificate_secrets", autospec=True
+    )
+    @mock.patch.object(driver.Driver, "_create_appcred_secret", autospec=True)
+    @mock.patch.object(helm.HelmLock, "renew", return_value=None)
+    @mock.patch.object(helm.HelmLock, "_acquire_lock", return_value=True)
+    @mock.patch.object(kubernetes.Client, "load", autospec=True)
+    @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
+    @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
+    def test_create_cluster_api_lb_allowed_cidrs_magnum_label(
+        self,
+        mock_install,
+        mock_image,
+        mock_load,
+        mock_helm_lock,
+        mock_renew,
+        mock_appcred,
+        mock_certs,
+        mock_get_net,
+        mock_validate_allowed_flavor,
+        mock_storageclasses,
+        mock_get_keystone_auth_enabled,
+    ):
+        cidrs = "192.168.0.0/16,10.0.0.0/8,123.123.123.123/32"
+        self._set_cluster_test_labels(dict(master_lb_allowed_cidrs=cidrs))
+        mock_image.return_value = (
+            "imageid1",
+            "1.27.4",
+            "ubuntu",
+        )
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+
+        self.driver.create_cluster(self.context, self.cluster_obj, 10)
+        helm_install_values = mock_install.call_args[0][3]
+        self.assertEqual(
+            helm_install_values["apiServer"]["allowedCIDRs"],
+            cidrs.split(","),
+        )
+
+    @mock.patch.object(
+        driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
+    )
+    @mock.patch.object(
+        driver.Driver,
+        "_storageclass_definitions",
+        return_value=mock.ANY,
+    )
+    @mock.patch.object(driver.Driver, "_validate_allowed_flavor")
+    @mock.patch.object(neutron, "get_network", autospec=True)
+    @mock.patch.object(
+        driver.Driver, "_ensure_certificate_secrets", autospec=True
+    )
+    @mock.patch.object(driver.Driver, "_create_appcred_secret", autospec=True)
+    @mock.patch.object(helm.HelmLock, "renew", return_value=None)
+    @mock.patch.object(helm.HelmLock, "_acquire_lock", return_value=True)
+    @mock.patch.object(kubernetes.Client, "load", autospec=True)
+    @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
+    @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
+    def test_create_cluster_api_lb_allowed_cidrs_extra(
+        self,
+        mock_install,
+        mock_image,
+        mock_load,
+        mock_helm_lock,
+        mock_renew,
+        mock_appcred,
+        mock_certs,
+        mock_get_net,
+        mock_validate_allowed_flavor,
+        mock_storageclasses,
+        mock_get_keystone_auth_enabled,
+    ):
+        cidrs = "192.168.0.0/16,10.0.0.0/8,123.123.123.123/32"
+        self._set_cluster_test_labels(dict(api_master_lb_allowed_cidrs=cidrs))
+        CONF.set_override(
+            "api_master_lb_extra_allowed_cidrs",
+            ["179.190.1.17/32", "10.0.0.0/8"],
+            group="capi_helm",
+        )
+        self.addCleanup(
+            CONF.clear_override,
+            "api_master_lb_extra_allowed_cidrs",
+            group="capi_helm",
+        )
+        mock_image.return_value = (
+            "imageid1",
+            "1.27.4",
+            "ubuntu",
+        )
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+
+        self.driver.create_cluster(self.context, self.cluster_obj, 10)
+        helm_install_values = mock_install.call_args[0][3]
+        # extra CIDRs appended once, no duplicates
+        self.assertEqual(
+            helm_install_values["apiServer"]["allowedCIDRs"],
+            cidrs.split(",") + ["179.190.1.17/32"],
+        )
+
+    @mock.patch.object(
+        driver.Driver, "_get_k8s_keystone_auth_enabled", return_value=False
+    )
+    @mock.patch.object(
+        driver.Driver,
+        "_storageclass_definitions",
+        return_value=mock.ANY,
+    )
+    @mock.patch.object(driver.Driver, "_validate_allowed_flavor")
+    @mock.patch.object(neutron, "get_network", autospec=True)
+    @mock.patch.object(
+        driver.Driver, "_ensure_certificate_secrets", autospec=True
+    )
+    @mock.patch.object(driver.Driver, "_create_appcred_secret", autospec=True)
+    @mock.patch.object(helm.HelmLock, "renew", return_value=None)
+    @mock.patch.object(helm.HelmLock, "_acquire_lock", return_value=True)
+    @mock.patch.object(kubernetes.Client, "load", autospec=True)
+    @mock.patch.object(driver.Driver, "_get_image_details", autospec=True)
+    @mock.patch.object(helm.Client, "install_or_upgrade", autospec=True)
+    def test_create_cluster_api_lb_no_allowed_cidrs_no_extra(
+        self,
+        mock_install,
+        mock_image,
+        mock_load,
+        mock_helm_lock,
+        mock_renew,
+        mock_appcred,
+        mock_certs,
+        mock_get_net,
+        mock_validate_allowed_flavor,
+        mock_storageclasses,
+        mock_get_keystone_auth_enabled,
+    ):
+        cidrs = "192.168.0.0/16,10.0.0.0/8,123.123.123.123/32"
+        self._set_cluster_test_labels(dict())
+        CONF.set_override(
+            "api_master_lb_extra_allowed_cidrs",
+            ["179.190.1.17/32"],
+            group="capi_helm",
+        )
+        self.addCleanup(
+            CONF.clear_override,
+            "api_master_lb_extra_allowed_cidrs",
+            group="capi_helm",
+        )
+        mock_image.return_value = (
+            "imageid1",
+            "1.27.4",
+            "ubuntu",
+        )
+        mock_client = mock.MagicMock(spec=kubernetes.Client)
+        mock_load.return_value = mock_client
+
+        self.driver.create_cluster(self.context, self.cluster_obj, 10)
+        helm_install_values = mock_install.call_args[0][3]
+        # no allow list on the cluster: API open to all, extras not added
+        self.assertNotIn(
+            "allowedCIDRs", helm_install_values.get("apiServer", {})
+        )
+
     @mock.patch.object(driver.Driver, "_get_k8s_keystone_auth_enabled")
     @mock.patch.object(
         driver.Driver,
