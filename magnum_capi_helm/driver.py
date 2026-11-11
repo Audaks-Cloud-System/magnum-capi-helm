@@ -1305,6 +1305,53 @@ class Driver(driver.Driver):
         LOG.debug(f"CIDR list {cidrs}")
         return cidrs
 
+    _ROUTER_INTERFACE_OWNERS = (
+        "network:router_interface",
+        "network:router_interface_distributed",
+        "network:ha_router_replicated_interface",
+    )
+
+    def _get_router_gateway_cidrs(self, context, cluster):
+        """External gateway IPs (/32) of the routers on the fixed network.
+
+        Nodes reach the API through its floating IP, so their traffic
+        leaves through the router's SNAT address. CAPO adds the router IPs
+        to the allow list only for a network it created itself; with an
+        existing network (cluster.fixed_network) we have to add them, or
+        the nodes are locked out of their own API (kubeadm init fails).
+        """
+        network_id = self._get_fixed_network_id(context, cluster)
+        if not network_id:
+            return []
+        nc = clients.OpenStackClients(context).neutron()
+        router_ids = set()
+        gateway_ips = []
+        for owner in self._ROUTER_INTERFACE_OWNERS:
+            if hasattr(nc, "list_ports"):
+                # neutronclient (Magnum stable branches)
+                ports = nc.list_ports(
+                    network_id=network_id, device_owner=owner
+                ).get("ports", [])
+                router_ids.update(p.get("device_id") for p in ports)
+            else:
+                # openstacksdk (Magnum master)
+                for p in nc.ports(network_id=network_id, device_owner=owner):
+                    router_ids.add(getattr(p, "device_id", None))
+        for router_id in sorted(r for r in router_ids if r):
+            if hasattr(nc, "show_router"):
+                router = nc.show_router(router_id).get("router", {})
+                gw = router.get("external_gateway_info") or {}
+            else:
+                gw = (
+                    getattr(nc.get_router(router_id), "external_gateway_info")
+                    or {}
+                )
+            for fixed_ip in gw.get("external_fixed_ips") or []:
+                ip = fixed_ip.get("ip_address")
+                if ip:
+                    gateway_ips.append(str(ipaddress.ip_network(ip)))
+        return gateway_ips
+
     def _chart_supports_allowed_cidrs(self, cluster):
         version = self._get_chart_version(cluster)
         return (
@@ -1651,6 +1698,22 @@ class Driver(driver.Driver):
 
             api_lb_allowed_cidrs = self._get_allowed_cidrs(cluster)
             if isinstance(api_lb_allowed_cidrs, list):
+                try:
+                    router_cidrs = self._get_router_gateway_cidrs(
+                        context, cluster
+                    )
+                except Exception as e:
+                    LOG.warning(
+                        "Cluster %s: could not read the routers of the "
+                        "fixed network, their SNAT IPs are not added to "
+                        "the API allow list: %s",
+                        cluster.uuid,
+                        e,
+                    )
+                    router_cidrs = []
+                for cidr in router_cidrs:
+                    if cidr not in api_lb_allowed_cidrs:
+                        api_lb_allowed_cidrs.append(cidr)
                 if not self._chart_supports_allowed_cidrs(cluster):
                     LOG.warning(
                         "Cluster %s sets an API allow list, but chart "
