@@ -15,6 +15,9 @@ from magnum.i18n import _
 from magnum.objects import fields as m_fields
 from magnum_capi_helm import driver_utils
 from magnum_capi_helm import kubernetes
+from oslo_log import log as logging
+
+LOG = logging.getLogger(__name__)
 
 
 MONITOR_STATE_READY = _("Ready")
@@ -81,6 +84,20 @@ class CAPIMonitor(monitors.MonitorBase):
         The class variable data is updated with current status and reason.
 
         """
+        if driver_utils.is_helm_locked(self._k8s_client, self.cluster):
+            # A Helm update for this cluster is still waiting for, or
+            # holding, the lock, so the CAPI resources may not yet
+            # reflect whatever is currently being applied. Leave
+            # self.data without a "health_status" key so magnum's
+            # periodic health sync skips updating cluster.health_status
+            # this cycle, rather than reporting on stale state.
+            LOG.debug(
+                "Helm lock currently held for %s; skipping health "
+                "status update until it is released",
+                self.cluster.uuid,
+            )
+            return
+
         # Start with a good state for everything
         status = m_fields.ClusterHealthStatus.HEALTHY
         reason = {}
@@ -158,7 +175,7 @@ class CAPIMonitor(monitors.MonitorBase):
         This CAPI controller manages the control plane machines
         """
         namespace = driver_utils.cluster_namespace(self.cluster)
-        resource_name = driver_utils.get_k8s_resource_name(
+        resource_name = driver_utils.chart_component_name(
             self.cluster, "control-plane"
         )
         resource_kcp = self._k8s_client.get_k8s_control_plane(
@@ -194,7 +211,7 @@ class CAPIMonitor(monitors.MonitorBase):
         for nodegroup in self.cluster.nodegroups:
             if nodegroup.role == "master":
                 continue
-            resource_name = driver_utils.get_k8s_resource_name(
+            resource_name = driver_utils.chart_component_name(
                 self.cluster, nodegroup.name
             )
             resource_md = self._k8s_client.get_machine_deployment(
