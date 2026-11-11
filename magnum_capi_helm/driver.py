@@ -473,6 +473,15 @@ class Driver(driver.Driver):
             else:
                 # If there are any addons that are not deployed or failed,
                 # wait for the next invocation to check again
+                if "kubernetes-dashboard" in addon_name:
+                    # Audaks: the dashboard addon can take a long time to
+                    # deploy (dependencies); do not hold the cluster in
+                    # CREATE_IN_PROGRESS for it.
+                    LOG.info(
+                        f"Skipping wait for addon {addon_name} to be deployed"
+                        f" for {cluster.uuid}, current phase: {addon_phase}"
+                    )
+                    continue
                 LOG.debug(
                     f"addon {addon_name} not yet deployed "
                     f"for {cluster.uuid}, current phase: {addon_phase}"
